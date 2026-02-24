@@ -19,6 +19,9 @@ go run ./main.go -port 50000 -log-packets
 go run ./main.go -port 50000 -log-packets -log-audio
 ```
 
+`-log-packets` includes codec config details (`codec_id`, `mode`, `pcm_only`) when `pktCodecConfig` is received.
+The server also emits UDP packet-size monitor logs (`udp_size_warn`, `udp_fragment_risk`, `udp_size_stats`) to help detect fragmentation risk at high bitrates.
+
 ## Docker build/run
 
 ```bash
