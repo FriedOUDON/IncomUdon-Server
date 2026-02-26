@@ -155,6 +155,7 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		s.broadcastExcept(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
 		s.sendTo(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
 		s.sendServerConfig(pkt.Header.ChannelId, pkt.Header.SenderId)
+		s.sendCurrentTalkState(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktLeave:
 		log.Printf("leave ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId)
@@ -324,6 +325,23 @@ func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
 	binary.BigEndian.PutUint16(payload, durationToSecondsClamped(s.talkMax))
 	packet := buildControlPacket(pktServerCfg, channelId, 0, payload, s.noCrypto)
 	s.sendTo(channelId, senderId, packet)
+}
+
+func (s *server) sendCurrentTalkState(channelId uint32, senderId uint32) {
+	s.mu.Lock()
+	ch := s.channels[channelId]
+	var talkerId uint32
+	if ch != nil {
+		talkerId = ch.currentTalk
+	}
+	s.mu.Unlock()
+
+	if talkerId == 0 {
+		return
+	}
+
+	log.Printf("join_sync_talker ch=%d to=%d talker=%d", channelId, senderId, talkerId)
+	s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, talkerId, s.noCrypto))
 }
 
 func (s *server) broadcast(channelId uint32, data []byte) {
