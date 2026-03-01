@@ -44,7 +44,7 @@ Notes:
 ## Docker build/run
 
 ```bash
-docker build -t incomudon-relay .
+docker build -t incomudon-relay . --no-cache
 docker run --rm -p 50000:50000/udp incomudon-relay
 ```
 
