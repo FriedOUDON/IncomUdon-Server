@@ -64,12 +64,13 @@ type parsedPacket struct {
 }
 
 type peer struct {
+	senderId uint32
 	addr     *net.UDPAddr
 	lastSeen time.Time
 }
 
 type channel struct {
-	peers       map[uint32]*peer
+	peers       map[string]*peer
 	currentTalk uint32
 	talkStart   time.Time
 }
@@ -91,6 +92,13 @@ type server struct {
 	lastWarnLog         time.Time
 	lastFragLog         time.Time
 	talkMax             time.Duration
+}
+
+func peerMapKey(addr *net.UDPAddr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }
 
 func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool, talkMax time.Duration) *server {
@@ -152,14 +160,14 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 	switch pkt.Header.Type {
 	case pktJoin:
 		log.Printf("join ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
-		s.broadcastExcept(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
+		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
 		s.sendTo(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
 		s.sendServerConfig(pkt.Header.ChannelId, pkt.Header.SenderId)
 		s.sendCurrentTalkState(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktLeave:
 		log.Printf("leave ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
-		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId)
-		s.broadcastExcept(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
+		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
+		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
 		s.releaseTalkIfNeeded(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktPttOn:
 		log.Printf("ptt_on ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
@@ -169,33 +177,39 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		s.handlePttOff(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktAudio:
 		if s.isTalker(pkt.Header.ChannelId, pkt.Header.SenderId) {
-			s.broadcastExcept(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
+			s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
 		}
 	default:
-		s.broadcastExcept(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
+		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
 	}
 }
 
 func (s *server) getOrCreateChannel(channelId uint32) *channel {
 	ch, ok := s.channels[channelId]
 	if !ok {
-		ch = &channel{peers: make(map[uint32]*peer)}
+		ch = &channel{peers: make(map[string]*peer)}
 		s.channels[channelId] = ch
 	}
 	return ch
 }
 
 func (s *server) upsertPeer(ch *channel, senderId uint32, addr *net.UDPAddr) {
-	p, ok := ch.peers[senderId]
+	key := peerMapKey(addr)
+	if key == "" {
+		return
+	}
+
+	p, ok := ch.peers[key]
 	if !ok {
 		p = &peer{addr: addr}
-		ch.peers[senderId] = p
+		ch.peers[key] = p
 	}
+	p.senderId = senderId
 	p.addr = addr
 	p.lastSeen = time.Now()
 }
 
-func (s *server) removePeer(channelId uint32, senderId uint32) {
+func (s *server) removePeer(channelId uint32, senderId uint32, addr *net.UDPAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -203,7 +217,24 @@ func (s *server) removePeer(channelId uint32, senderId uint32) {
 	if ch == nil {
 		return
 	}
-	delete(ch.peers, senderId)
+
+	removed := false
+	key := peerMapKey(addr)
+	if key != "" {
+		if p, ok := ch.peers[key]; ok && (senderId == 0 || p.senderId == senderId) {
+			delete(ch.peers, key)
+			removed = true
+		}
+	}
+	if !removed && senderId != 0 {
+		for k, p := range ch.peers {
+			if p.senderId == senderId {
+				delete(ch.peers, k)
+				break
+			}
+		}
+	}
+
 	if len(ch.peers) == 0 {
 		delete(s.channels, channelId)
 	}
@@ -363,7 +394,7 @@ func (s *server) broadcast(channelId uint32, data []byte) {
 	}
 }
 
-func (s *server) broadcastExcept(channelId uint32, senderId uint32, data []byte) {
+func (s *server) broadcastExceptAddr(channelId uint32, excludeAddr *net.UDPAddr, data []byte) {
 	s.mu.Lock()
 	ch := s.channels[channelId]
 	if ch == nil {
@@ -371,9 +402,10 @@ func (s *server) broadcastExcept(channelId uint32, senderId uint32, data []byte)
 		return
 	}
 
+	excludeKey := peerMapKey(excludeAddr)
 	peers := make([]*peer, 0, len(ch.peers))
-	for id, p := range ch.peers {
-		if id == senderId {
+	for key, p := range ch.peers {
+		if excludeKey != "" && key == excludeKey {
 			continue
 		}
 		peers = append(peers, p)
@@ -393,10 +425,15 @@ func (s *server) sendTo(channelId uint32, senderId uint32, data []byte) {
 		return
 	}
 
-	p := ch.peers[senderId]
+	peers := make([]*peer, 0, len(ch.peers))
+	for _, p := range ch.peers {
+		if p.senderId == senderId {
+			peers = append(peers, p)
+		}
+	}
 	s.mu.Unlock()
 
-	if p != nil {
+	for _, p := range peers {
 		s.conn.WriteToUDP(data, p.addr)
 	}
 }
@@ -410,14 +447,14 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 
 		s.mu.Lock()
 		for channelId, ch := range s.channels {
-			for id, p := range ch.peers {
+			for key, p := range ch.peers {
 				if now.Sub(p.lastSeen) > timeout {
-					delete(ch.peers, id)
-					if ch.currentTalk == id {
+					delete(ch.peers, key)
+					if ch.currentTalk == p.senderId {
 						ch.currentTalk = 0
 						ch.talkStart = time.Time{}
 						s.mu.Unlock()
-						s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, id, s.noCrypto))
+						s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, p.senderId, s.noCrypto))
 						s.mu.Lock()
 					}
 				}
