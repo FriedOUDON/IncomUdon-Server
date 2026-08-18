@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -70,9 +71,8 @@ type peer struct {
 }
 
 type channel struct {
-	peers       map[string]*peer
-	currentTalk uint32
-	talkStart   time.Time
+	peers         map[string]*peer
+	activeTalkers map[uint32]time.Time
 }
 
 type server struct {
@@ -92,6 +92,8 @@ type server struct {
 	lastWarnLog         time.Time
 	lastFragLog         time.Time
 	talkMax             time.Duration
+	multiTalk           bool
+	maxActiveTalkers    int
 }
 
 func peerMapKey(addr *net.UDPAddr) string {
@@ -101,15 +103,20 @@ func peerMapKey(addr *net.UDPAddr) string {
 	return addr.String()
 }
 
-func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool, talkMax time.Duration) *server {
+func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool, talkMax time.Duration, multiTalk bool, maxActiveTalkers int) *server {
+	if maxActiveTalkers < 1 {
+		maxActiveTalkers = 1
+	}
 	return &server{
-		channels:        make(map[uint32]*channel),
-		conn:            conn,
-		noCrypto:        noCrypto,
-		logPackets:      logPackets,
-		logAudio:        logAudio,
-		sizeWindowStart: time.Now(),
-		talkMax:         talkMax,
+		channels:         make(map[uint32]*channel),
+		conn:             conn,
+		noCrypto:         noCrypto,
+		logPackets:       logPackets,
+		logAudio:         logAudio,
+		sizeWindowStart:  time.Now(),
+		talkMax:          talkMax,
+		multiTalk:        multiTalk,
+		maxActiveTalkers: maxActiveTalkers,
 	}
 }
 
@@ -144,12 +151,14 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		return
 	}
 
-	if releasedTalkerID, expired := s.expireTalkIfNeeded(pkt.Header.ChannelId); expired {
-		log.Printf("talk_timeout ch=%d talker=%d max=%s",
-			pkt.Header.ChannelId,
-			releasedTalkerID,
-			s.talkMax)
-		s.broadcast(pkt.Header.ChannelId, buildTalkPacket(pktTalkRelease, pkt.Header.ChannelId, releasedTalkerID, s.noCrypto))
+	if releasedTalkerIDs := s.expireTalkIfNeeded(pkt.Header.ChannelId); len(releasedTalkerIDs) > 0 {
+		for _, releasedTalkerID := range releasedTalkerIDs {
+			log.Printf("talk_timeout ch=%d talker=%d max=%s",
+				pkt.Header.ChannelId,
+				releasedTalkerID,
+				s.talkMax)
+			s.broadcast(pkt.Header.ChannelId, buildTalkPacket(pktTalkRelease, pkt.Header.ChannelId, releasedTalkerID, s.noCrypto))
+		}
 	}
 
 	s.mu.Lock()
@@ -187,10 +196,34 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 func (s *server) getOrCreateChannel(channelId uint32) *channel {
 	ch, ok := s.channels[channelId]
 	if !ok {
-		ch = &channel{peers: make(map[string]*peer)}
+		ch = &channel{
+			peers:         make(map[string]*peer),
+			activeTalkers: make(map[uint32]time.Time),
+		}
 		s.channels[channelId] = ch
 	}
 	return ch
+}
+
+func sortedActiveTalkers(ch *channel) []uint32 {
+	if ch == nil || len(ch.activeTalkers) == 0 {
+		return nil
+	}
+
+	talkers := make([]uint32, 0, len(ch.activeTalkers))
+	for senderID := range ch.activeTalkers {
+		talkers = append(talkers, senderID)
+	}
+	sort.Slice(talkers, func(i, j int) bool { return talkers[i] < talkers[j] })
+	return talkers
+}
+
+func firstActiveTalker(ch *channel) uint32 {
+	talkers := sortedActiveTalkers(ch)
+	if len(talkers) == 0 {
+		return 0
+	}
+	return talkers[0]
 }
 
 func (s *server) upsertPeer(ch *channel, senderId uint32, addr *net.UDPAddr) {
@@ -248,7 +281,8 @@ func (s *server) isTalker(channelId uint32, senderId uint32) bool {
 	if ch == nil {
 		return false
 	}
-	return ch.currentTalk == senderId
+	_, ok := ch.activeTalkers[senderId]
+	return ok
 }
 
 func (s *server) handlePttOn(channelId uint32, senderId uint32) {
@@ -259,35 +293,53 @@ func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 		return
 	}
 
-	if ch.currentTalk == 0 {
-		ch.currentTalk = senderId
-		ch.talkStart = time.Now()
-		s.mu.Unlock()
-		log.Printf("talk_grant ch=%d talker=%d", channelId, senderId)
-		s.broadcast(channelId, buildTalkPacket(pktTalkGrant, channelId, senderId, s.noCrypto))
-		return
-	}
-	if ch.currentTalk == senderId {
+	now := time.Now()
+	if _, ok := ch.activeTalkers[senderId]; ok {
+		ch.activeTalkers[senderId] = now
 		s.mu.Unlock()
 		log.Printf("talk_grant ch=%d talker=%d (already granted)", channelId, senderId)
 		s.broadcast(channelId, buildTalkPacket(pktTalkGrant, channelId, senderId, s.noCrypto))
 		return
 	}
+
+	limit := 1
+	if s.multiTalk {
+		limit = s.maxActiveTalkers
+	}
+	if limit < 1 {
+		limit = 1
+	}
+
+	if len(ch.activeTalkers) < limit {
+		ch.activeTalkers[senderId] = now
+		activeCount := len(ch.activeTalkers)
+		s.mu.Unlock()
+		log.Printf("talk_grant ch=%d talker=%d active=%d/%d multi=%t", channelId, senderId, activeCount, limit, s.multiTalk)
+		s.broadcast(channelId, buildTalkPacket(pktTalkGrant, channelId, senderId, s.noCrypto))
+		return
+	}
+
+	current := firstActiveTalker(ch)
+	activeCount := len(ch.activeTalkers)
 	s.mu.Unlock()
-	log.Printf("talk_deny ch=%d requester=%d current=%d", channelId, senderId, ch.currentTalk)
-	s.sendTo(channelId, senderId, buildTalkPacket(pktTalkDeny, channelId, ch.currentTalk, s.noCrypto))
+	log.Printf("talk_deny ch=%d requester=%d current=%d active=%d/%d multi=%t", channelId, senderId, current, activeCount, limit, s.multiTalk)
+	s.sendTo(channelId, senderId, buildTalkPacket(pktTalkDeny, channelId, current, s.noCrypto))
 }
 
 func (s *server) handlePttOff(channelId uint32, senderId uint32) {
 	s.mu.Lock()
 	ch := s.channels[channelId]
-	if ch == nil || ch.currentTalk != senderId {
+	if ch == nil {
 		s.mu.Unlock()
 		return
 	}
 
-	ch.currentTalk = 0
-	ch.talkStart = time.Time{}
+	if _, ok := ch.activeTalkers[senderId]; !ok {
+		s.mu.Unlock()
+		return
+	}
+
+	delete(ch.activeTalkers, senderId)
 	s.mu.Unlock()
 	log.Printf("talk_release ch=%d talker=%d", channelId, senderId)
 	s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, senderId, s.noCrypto))
@@ -296,45 +348,50 @@ func (s *server) handlePttOff(channelId uint32, senderId uint32) {
 func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32) {
 	s.mu.Lock()
 	ch := s.channels[channelId]
-	if ch == nil || ch.currentTalk != senderId {
+	if ch == nil {
 		s.mu.Unlock()
 		return
 	}
 
-	ch.currentTalk = 0
-	ch.talkStart = time.Time{}
+	if _, ok := ch.activeTalkers[senderId]; !ok {
+		s.mu.Unlock()
+		return
+	}
+
+	delete(ch.activeTalkers, senderId)
 	s.mu.Unlock()
 	log.Printf("talk_release ch=%d talker=%d (peer_left)", channelId, senderId)
 	s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, senderId, s.noCrypto))
 }
 
-func (s *server) expireTalkIfNeeded(channelId uint32) (releasedTalkerID uint32, expired bool) {
+func (s *server) expireTalkIfNeeded(channelId uint32) []uint32 {
 	if s.talkMax <= 0 {
-		return 0, false
+		return nil
 	}
 
 	now := time.Now()
 	s.mu.Lock()
 	ch := s.channels[channelId]
-	if ch == nil || ch.currentTalk == 0 {
+	if ch == nil || len(ch.activeTalkers) == 0 {
 		s.mu.Unlock()
-		return 0, false
-	}
-	if ch.talkStart.IsZero() {
-		ch.talkStart = now
-		s.mu.Unlock()
-		return 0, false
-	}
-	if now.Sub(ch.talkStart) < s.talkMax {
-		s.mu.Unlock()
-		return 0, false
+		return nil
 	}
 
-	released := ch.currentTalk
-	ch.currentTalk = 0
-	ch.talkStart = time.Time{}
+	released := make([]uint32, 0, len(ch.activeTalkers))
+	for senderID, startedAt := range ch.activeTalkers {
+		if startedAt.IsZero() {
+			ch.activeTalkers[senderID] = now
+			continue
+		}
+		if now.Sub(startedAt) < s.talkMax {
+			continue
+		}
+		delete(ch.activeTalkers, senderID)
+		released = append(released, senderID)
+	}
 	s.mu.Unlock()
-	return released, true
+	sort.Slice(released, func(i, j int) bool { return released[i] < released[j] })
+	return released
 }
 
 func durationToSecondsClamped(d time.Duration) uint16 {
@@ -352,8 +409,19 @@ func durationToSecondsClamped(d time.Duration) uint16 {
 }
 
 func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
-	payload := make([]byte, 2)
+	payload := make([]byte, 4)
 	binary.BigEndian.PutUint16(payload, durationToSecondsClamped(s.talkMax))
+	if s.multiTalk {
+		payload[2] |= 0x01
+	}
+	limit := s.maxActiveTalkers
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 0xFF {
+		limit = 0xFF
+	}
+	payload[3] = byte(limit)
 	packet := buildControlPacket(pktServerCfg, channelId, 0, payload, s.noCrypto)
 	s.sendTo(channelId, senderId, packet)
 }
@@ -361,18 +429,17 @@ func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
 func (s *server) sendCurrentTalkState(channelId uint32, senderId uint32) {
 	s.mu.Lock()
 	ch := s.channels[channelId]
-	var talkerId uint32
-	if ch != nil {
-		talkerId = ch.currentTalk
-	}
+	talkers := sortedActiveTalkers(ch)
 	s.mu.Unlock()
 
-	if talkerId == 0 {
+	if len(talkers) == 0 {
 		return
 	}
 
-	log.Printf("join_sync_talker ch=%d to=%d talker=%d", channelId, senderId, talkerId)
-	s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, talkerId, s.noCrypto))
+	for _, talkerID := range talkers {
+		log.Printf("join_sync_talker ch=%d to=%d talker=%d", channelId, senderId, talkerID)
+		s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, talkerID, s.noCrypto))
+	}
 }
 
 func (s *server) broadcast(channelId uint32, data []byte) {
@@ -447,32 +514,40 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 
 		s.mu.Lock()
 		for channelId, ch := range s.channels {
+			releasedTalkers := make([]uint32, 0)
 			for key, p := range ch.peers {
 				if now.Sub(p.lastSeen) > timeout {
 					delete(ch.peers, key)
-					if ch.currentTalk == p.senderId {
-						ch.currentTalk = 0
-						ch.talkStart = time.Time{}
-						s.mu.Unlock()
-						s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, p.senderId, s.noCrypto))
-						s.mu.Lock()
+					if _, ok := ch.activeTalkers[p.senderId]; ok {
+						delete(ch.activeTalkers, p.senderId)
+						releasedTalkers = append(releasedTalkers, p.senderId)
 					}
 				}
 			}
-			if s.talkMax > 0 &&
-				ch.currentTalk != 0 &&
-				!ch.talkStart.IsZero() &&
-				now.Sub(ch.talkStart) >= s.talkMax {
-				talker := ch.currentTalk
-				ch.currentTalk = 0
-				ch.talkStart = time.Time{}
-				s.mu.Unlock()
-				log.Printf("talk_timeout ch=%d talker=%d max=%s", channelId, talker, s.talkMax)
-				s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, talker, s.noCrypto))
-				s.mu.Lock()
+			if s.talkMax > 0 {
+				for senderID, startedAt := range ch.activeTalkers {
+					if startedAt.IsZero() {
+						ch.activeTalkers[senderID] = now
+						continue
+					}
+					if now.Sub(startedAt) < s.talkMax {
+						continue
+					}
+					delete(ch.activeTalkers, senderID)
+					releasedTalkers = append(releasedTalkers, senderID)
+				}
 			}
 			if len(ch.peers) == 0 {
 				delete(s.channels, channelId)
+			}
+			if len(releasedTalkers) > 0 {
+				sort.Slice(releasedTalkers, func(i, j int) bool { return releasedTalkers[i] < releasedTalkers[j] })
+				s.mu.Unlock()
+				for _, talker := range releasedTalkers {
+					log.Printf("talk_release ch=%d talker=%d (cleanup)", channelId, talker)
+					s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, talker, s.noCrypto))
+				}
+				s.mu.Lock()
 			}
 		}
 		s.mu.Unlock()
@@ -748,6 +823,24 @@ func main() {
 		}
 	}
 	talkMaxSec := flag.Int("talk-max-sec", talkMaxSecDefault, "max TX hold time in seconds (0 disables timeout)")
+	multiTalkDefault := false
+	if raw := os.Getenv("INCOMUDON_MULTI_TALK"); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			multiTalkDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_MULTI_TALK=%q (using false)", raw)
+		}
+	}
+	maxActiveTalkersDefault := 2
+	if raw := os.Getenv("INCOMUDON_MAX_ACTIVE_TALKERS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			maxActiveTalkersDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_MAX_ACTIVE_TALKERS=%q (using 2)", raw)
+		}
+	}
+	multiTalk := flag.Bool("multi-talk", multiTalkDefault, "allow multiple simultaneous talkers")
+	maxActiveTalkers := flag.Int("max-active-talkers", maxActiveTalkersDefault, "maximum simultaneous active talkers when multi-talk is enabled")
 	noCrypto := flag.Bool("no-crypto", false, "accept/send packets without security header/tag")
 	logPackets := flag.Bool("log-packets", false, "log received packets")
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
@@ -755,6 +848,9 @@ func main() {
 
 	if *talkMaxSec < 0 {
 		*talkMaxSec = 0
+	}
+	if *maxActiveTalkers < 1 {
+		*maxActiveTalkers = 1
 	}
 	talkMax := time.Duration(*talkMaxSec) * time.Second
 
@@ -769,12 +865,12 @@ func main() {
 	if *noCrypto {
 		mode = "no-crypto"
 	}
-	log.Printf("IncomUdon relay listening on udp :%d (%s, talk_max=%ds)", *port, mode, *talkMaxSec)
+	log.Printf("IncomUdon relay listening on udp :%d (%s, talk_max=%ds, multi_talk=%t, max_active_talkers=%d)", *port, mode, *talkMaxSec, *multiTalk, *maxActiveTalkers)
 
 	if *logAudio {
 		*logPackets = true
 	}
-	srv := newServer(conn, *noCrypto, *logPackets, *logAudio, talkMax)
+	srv := newServer(conn, *noCrypto, *logPackets, *logAudio, talkMax, *multiTalk, *maxActiveTalkers)
 	go srv.cleanupLoop(*timeout)
 	srv.run()
 }
