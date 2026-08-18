@@ -1,0 +1,136 @@
+package main
+
+import (
+	"net"
+	"testing"
+	"time"
+)
+
+func newTestUDPConn(t *testing.T) *net.UDPConn {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen UDP: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+func receiveTestPacket(t *testing.T, conn *net.UDPConn) parsedPacket {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buffer := make([]byte, 2048)
+	n, _, err := conn.ReadFromUDP(buffer)
+	if err != nil {
+		t.Fatalf("read UDP: %v", err)
+	}
+	packet, ok := parsePacket(buffer[:n], true)
+	if !ok {
+		t.Fatal("received invalid packet")
+	}
+	return packet
+}
+
+func expectNoTestPacket(t *testing.T, conn *net.UDPConn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buffer := make([]byte, 2048)
+	if _, _, err := conn.ReadFromUDP(buffer); err == nil {
+		t.Fatal("unexpected UDP packet")
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("read UDP: %v", err)
+	}
+}
+
+func TestDuplicatePttOnOnlyRegrantsRequester(t *testing.T) {
+	relay := newTestUDPConn(t)
+	requester := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 41
+	const requesterID uint32 = 1001
+
+	s := newServer(relay, true, false, false, 0, true, 2)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			"requester": {addr: requester.LocalAddr().(*net.UDPAddr), senderId: requesterID},
+			"listener":  {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 1002},
+		},
+		activeTalkers: map[uint32]time.Time{requesterID: time.Now()},
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	s.handlePttOn(channelID, requesterID)
+	packet := receiveTestPacket(t, requester)
+	if packet.Header.Type != pktTalkGrant {
+		t.Fatalf("expected grant, got type=%d", packet.Header.Type)
+	}
+	expectNoTestPacket(t, listener)
+}
+
+func TestJoinSyncSendsCodecConfigBeforeGrant(t *testing.T) {
+	relay := newTestUDPConn(t)
+	joiner := newTestUDPConn(t)
+	const channelID uint32 = 42
+	const talkerID uint32 = 2001
+	const joinerID uint32 = 2002
+	codecConfig := []byte{0, 1, 0x06, 0x40}
+
+	s := newServer(relay, true, false, false, 0, true, 2)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			"joiner": {addr: joiner.LocalAddr().(*net.UDPAddr), senderId: joinerID},
+		},
+		activeTalkers: map[uint32]time.Time{talkerID: time.Now()},
+		codecConfigs:  map[uint32][]byte{talkerID: codecConfig},
+	}
+
+	s.sendCurrentTalkState(channelID, joinerID)
+	configPacket := receiveTestPacket(t, joiner)
+	grantPacket := receiveTestPacket(t, joiner)
+	if configPacket.Header.Type != pktCodecConfig || configPacket.Header.SenderId != talkerID {
+		t.Fatalf("expected talker codec config first, got type=%d sender=%d", configPacket.Header.Type, configPacket.Header.SenderId)
+	}
+	if string(configPacket.Payload) != string(codecConfig) {
+		t.Fatalf("unexpected codec config payload: %v", configPacket.Payload)
+	}
+	if grantPacket.Header.Type != pktTalkGrant || grantPacket.Header.SenderId != talkerID {
+		t.Fatalf("expected talker grant second, got type=%d sender=%d", grantPacket.Header.Type, grantPacket.Header.SenderId)
+	}
+}
+
+func TestFecRequiresActiveTalker(t *testing.T) {
+	relay := newTestUDPConn(t)
+	sender := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 43
+	const senderID uint32 = 3001
+
+	s := newServer(relay, true, false, false, 0, true, 2)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			"sender":   {addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID},
+			"listener": {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 3002},
+		},
+		activeTalkers: make(map[uint32]time.Time),
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	raw := buildControlPacket(pktFec, channelID, senderID, []byte{0, 0, 6, 0, 1}, true)
+	packet, ok := parsePacket(raw, true)
+	if !ok {
+		t.Fatal("failed to build FEC test packet")
+	}
+	s.handlePacket(packet, sender.LocalAddr().(*net.UDPAddr))
+	expectNoTestPacket(t, listener)
+
+	s.channels[channelID].activeTalkers[senderID] = time.Now()
+	s.handlePacket(packet, sender.LocalAddr().(*net.UDPAddr))
+	forwarded := receiveTestPacket(t, listener)
+	if forwarded.Header.Type != pktFec {
+		t.Fatalf("expected FEC packet, got type=%d", forwarded.Header.Type)
+	}
+}

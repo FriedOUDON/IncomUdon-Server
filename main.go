@@ -73,6 +73,7 @@ type peer struct {
 type channel struct {
 	peers         map[string]*peer
 	activeTalkers map[uint32]time.Time
+	codecConfigs  map[uint32][]byte
 }
 
 type server struct {
@@ -184,7 +185,11 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 	case pktPttOff:
 		log.Printf("ptt_off ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.handlePttOff(pkt.Header.ChannelId, pkt.Header.SenderId)
-	case pktAudio:
+	case pktCodecConfig:
+		s.cacheCodecConfig(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload)
+		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
+	case pktAudio, pktFec:
+		// FEC belongs to the same authorized media stream as audio.
 		if s.isTalker(pkt.Header.ChannelId, pkt.Header.SenderId) {
 			s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
 		}
@@ -199,6 +204,7 @@ func (s *server) getOrCreateChannel(channelId uint32) *channel {
 		ch = &channel{
 			peers:         make(map[string]*peer),
 			activeTalkers: make(map[uint32]time.Time),
+			codecConfigs:  make(map[uint32][]byte),
 		}
 		s.channels[channelId] = ch
 	}
@@ -224,6 +230,24 @@ func firstActiveTalker(ch *channel) uint32 {
 		return 0
 	}
 	return talkers[0]
+}
+
+func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []byte) {
+	if len(payload) < 3 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ch := s.channels[channelId]
+	if ch == nil {
+		return
+	}
+	if ch.codecConfigs == nil {
+		ch.codecConfigs = make(map[uint32][]byte)
+	}
+	ch.codecConfigs[senderId] = append(ch.codecConfigs[senderId][:0], payload...)
 }
 
 func (s *server) upsertPeer(ch *channel, senderId uint32, addr *net.UDPAddr) {
@@ -298,7 +322,9 @@ func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 		ch.activeTalkers[senderId] = now
 		s.mu.Unlock()
 		log.Printf("talk_grant ch=%d talker=%d (already granted)", channelId, senderId)
-		s.broadcast(channelId, buildTalkPacket(pktTalkGrant, channelId, senderId, s.noCrypto))
+		// A duplicated PTT_ON should only repair a lost grant for its sender.
+		// Broadcasting it resets remote receivers' per-talker playout state.
+		s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, senderId, s.noCrypto))
 		return
 	}
 
@@ -426,19 +452,36 @@ func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
 	s.sendTo(channelId, senderId, packet)
 }
 
+type talkerSyncState struct {
+	talkerID    uint32
+	codecConfig []byte
+}
+
 func (s *server) sendCurrentTalkState(channelId uint32, senderId uint32) {
 	s.mu.Lock()
 	ch := s.channels[channelId]
-	talkers := sortedActiveTalkers(ch)
-	s.mu.Unlock()
-
-	if len(talkers) == 0 {
+	if ch == nil {
+		s.mu.Unlock()
 		return
 	}
-
+	talkers := sortedActiveTalkers(ch)
+	states := make([]talkerSyncState, 0, len(talkers))
 	for _, talkerID := range talkers {
-		log.Printf("join_sync_talker ch=%d to=%d talker=%d", channelId, senderId, talkerID)
-		s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, talkerID, s.noCrypto))
+		states = append(states, talkerSyncState{
+			talkerID:    talkerID,
+			codecConfig: append([]byte(nil), ch.codecConfigs[talkerID]...),
+		})
+	}
+	s.mu.Unlock()
+
+	for _, state := range states {
+		// Configure the per-talker decoder before announcing that audio may arrive.
+		if len(state.codecConfig) >= 3 {
+			s.sendTo(channelId, senderId,
+				buildControlPacket(pktCodecConfig, channelId, state.talkerID, state.codecConfig, s.noCrypto))
+		}
+		log.Printf("join_sync_talker ch=%d to=%d talker=%d codec_config=%t", channelId, senderId, state.talkerID, len(state.codecConfig) >= 3)
+		s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, state.talkerID, s.noCrypto))
 	}
 }
 

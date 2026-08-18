@@ -1,0 +1,13 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: incomudon-relay:local
+    ports:
+      - "${INCOMUDON_RELAY_PORT:-50000}:50000/udp"
+    environment:
+      INCOMUDON_TALK_MAX_SEC: "${INCOMUDON_TALK_MAX_SEC:-0}"
+      INCOMUDON_MULTI_TALK: "${INCOMUDON_MULTI_TALK:-false}"
+      INCOMUDON_MAX_ACTIVE_TALKERS: "${INCOMUDON_MAX_ACTIVE_TALKERS:-2}"
+    restart: unless-stopped
