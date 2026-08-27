@@ -1,0 +1,6 @@
+# Speaker directory. all applies to every configured channel; a channel row overrides it.
+channel_id,sender_id,name
+all,1001,Dispatch-1
+101,1002,Field-Team-A
+102,1001,Maintenance-Dispatch-1
+102,2001,Maintenance-Lead

@@ -884,6 +884,13 @@ func main() {
 	}
 	multiTalk := flag.Bool("multi-talk", multiTalkDefault, "allow multiple simultaneous talkers")
 	maxActiveTalkers := flag.Int("max-active-talkers", maxActiveTalkersDefault, "maximum simultaneous active talkers when multi-talk is enabled")
+	directoryChannelsCSV := flag.String("directory-channels-csv", os.Getenv("INCOMUDON_DIRECTORY_CHANNELS_CSV"), "CSV file containing channel_id,name for PSK directory publishing")
+	directorySpeakersCSV := flag.String("directory-speakers-csv", os.Getenv("INCOMUDON_DIRECTORY_SPEAKERS_CSV"), "CSV file containing channel_id,sender_id,name for PSK directory publishing")
+	directoryUDPTarget := flag.String("directory-udp-target", os.Getenv("INCOMUDON_DIRECTORY_UDP_TARGET"), "PWA UDP target for PSK directory snapshots")
+	directoryPSKFile := flag.String("directory-psk-file", os.Getenv("INCOMUDON_DIRECTORY_PSK_FILE"), "path to base64url directory PSK file")
+	directoryKeyID := flag.String("directory-key-id", os.Getenv("INCOMUDON_DIRECTORY_KEY_ID"), "directory PSK recipient key ID (default pwa-1)")
+	directoryPublishInterval := flag.Duration("directory-publish-interval", directoryDurationFromEnv("INCOMUDON_DIRECTORY_PUBLISH_INTERVAL", directoryDefaultInterval), "directory snapshot publish interval")
+	directoryTTL := flag.Duration("directory-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_TTL", directoryDefaultTTL), "directory snapshot validity")
 	noCrypto := flag.Bool("no-crypto", false, "accept/send packets without security header/tag")
 	logPackets := flag.Bool("log-packets", false, "log received packets")
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
@@ -903,6 +910,24 @@ func main() {
 		log.Fatalf("listen error: %v", err)
 	}
 	defer conn.Close()
+
+	directoryPublisher, err := newDirectoryPublisher(directoryPublisherConfig{
+		ChannelsCSV: *directoryChannelsCSV,
+		SpeakersCSV: *directorySpeakersCSV,
+		Target:      *directoryUDPTarget,
+		PSKFile:     *directoryPSKFile,
+		KeyID:       *directoryKeyID,
+		Interval:    *directoryPublishInterval,
+		TTL:         *directoryTTL,
+	})
+	if err != nil {
+		log.Fatalf("invalid directory publishing configuration: %v", err)
+	}
+	if directoryPublisher != nil {
+		defer directoryPublisher.Close()
+		log.Printf("PSK directory publishing enabled: target=%s interval=%s ttl=%s", *directoryUDPTarget, *directoryPublishInterval, *directoryTTL)
+		go directoryPublisher.Run()
+	}
 
 	mode := "encrypted"
 	if *noCrypto {

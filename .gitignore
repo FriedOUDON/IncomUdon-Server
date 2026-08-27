@@ -1,2 +1,5 @@
 incomudon-server.exe
 .env
+/directory/channels.csv
+/directory/speakers.csv
+/directory/directory.psk

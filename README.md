@@ -3,20 +3,20 @@
 ## Local run
 
 ```bash
-go run ./main.go -port 50000
+go run . -port 50000
 ```
 
 ## No-crypto test mode
 
 ```bash
-go run ./main.go -port 50000 -no-crypto
+go run . -port 50000 -no-crypto
 ```
 
 ## Packet logging
 
 ```bash
-go run ./main.go -port 50000 -log-packets
-go run ./main.go -port 50000 -log-packets -log-audio
+go run . -port 50000 -log-packets
+go run . -port 50000 -log-packets -log-audio
 ```
 
 `-log-packets` includes codec config details (`codec_id`, `mode`, `pcm_only`) when `pktCodecConfig` is received.
@@ -27,13 +27,13 @@ The server also emits UDP packet-size monitor logs (`udp_size_warn`, `udp_fragme
 Set talk timeout by CLI flag:
 
 ```bash
-go run ./main.go -port 50000 -talk-max-sec 60
+go run . -port 50000 -talk-max-sec 60
 ```
 
 Or by environment variable:
 
 ```bash
-INCOMUDON_TALK_MAX_SEC=60 go run ./main.go -port 50000
+INCOMUDON_TALK_MAX_SEC=60 go run . -port 50000
 ```
 
 Notes:
@@ -47,7 +47,7 @@ The relay remains the authority for PTT admission. Enable simultaneous transmit
 and set the channel-wide talker limit with CLI flags:
 
 ```bash
-go run ./main.go -port 50000 -multi-talk -max-active-talkers 2
+go run . -port 50000 -multi-talk -max-active-talkers 2
 ```
 
 Or use environment variables (CLI flags take precedence):
@@ -55,7 +55,7 @@ Or use environment variables (CLI flags take precedence):
 ```bash
 INCOMUDON_MULTI_TALK=true \
 INCOMUDON_MAX_ACTIVE_TALKERS=2 \
-go run ./main.go -port 50000
+go run . -port 50000
 ```
 
 Notes:
@@ -65,6 +65,11 @@ Notes:
 - A late-joining client receives the current talkers' cached codec settings
   before their `TALK_GRANT` packets, so each stream starts with the correct
   decoder configuration.
+
+## Directory Provisioning
+
+For PSK-protected channel and speaker name provisioning to a PWA server, see
+[directory.md](directory.md).
 
 ## Docker Compose
 

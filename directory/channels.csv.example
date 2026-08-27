@@ -1,0 +1,4 @@
+# Channel directory. The header is optional.
+channel_id,name
+101,Operations
+102,Maintenance
