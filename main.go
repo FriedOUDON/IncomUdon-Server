@@ -939,6 +939,15 @@ func main() {
 		}
 	}
 	directoryEnabled := flag.Bool("directory-enabled", directoryEnabledDefault, "enable PSK-protected directory publishing and pull requests")
+	directoryDynamicClientsDefault := false
+	if raw := os.Getenv("INCOMUDON_DIRECTORY_DYNAMIC_CLIENTS_ENABLED"); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			directoryDynamicClientsDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_DIRECTORY_DYNAMIC_CLIENTS_ENABLED=%q (using false)", raw)
+		}
+	}
+	directoryDynamicClients := flag.Bool("directory-dynamic-clients", directoryDynamicClientsDefault, "accept authenticated PWA/native directory client registrations")
 	directoryChannelsCSV := flag.String("directory-channels-csv", os.Getenv("INCOMUDON_DIRECTORY_CHANNELS_CSV"), "CSV file containing channel_id,name for PSK directory publishing")
 	directorySpeakersCSV := flag.String("directory-speakers-csv", os.Getenv("INCOMUDON_DIRECTORY_SPEAKERS_CSV"), "CSV file containing channel_id,sender_id,name for PSK directory publishing")
 	directoryUDPTarget := flag.String("directory-udp-target", os.Getenv("INCOMUDON_DIRECTORY_UDP_TARGET"), "PWA UDP target for PSK directory snapshots")
@@ -950,8 +959,10 @@ func main() {
 	directoryPSKFile := flag.String("directory-psk-file", os.Getenv("INCOMUDON_DIRECTORY_PSK_FILE"), "path to base64url directory PSK file")
 	directoryKeyID := flag.String("directory-key-id", os.Getenv("INCOMUDON_DIRECTORY_KEY_ID"), "directory PSK recipient key ID (default pwa-1)")
 	directoryRequestAllowCIDRs := flag.String("directory-request-allow-cidrs", os.Getenv("INCOMUDON_DIRECTORY_REQUEST_ALLOW_CIDRS"), "optional comma-separated source CIDRs allowed to request directory snapshots")
+	directoryClientAllowCIDRs := flag.String("directory-client-allow-cidrs", os.Getenv("INCOMUDON_DIRECTORY_CLIENT_ALLOW_CIDRS"), "optional comma-separated source CIDRs allowed to register dynamic directory clients")
 	directoryPublishInterval := flag.Duration("directory-publish-interval", directoryDurationFromEnv("INCOMUDON_DIRECTORY_PUBLISH_INTERVAL", directoryDefaultInterval), "directory snapshot publish interval")
 	directoryTTL := flag.Duration("directory-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_TTL", directoryDefaultTTL), "directory snapshot validity")
+	directoryClientTTL := flag.Duration("directory-client-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_CLIENT_TTL", directoryDefaultClientTTL), "dynamic directory client registration validity")
 	noCrypto := flag.Bool("no-crypto", false, "accept/send packets without security header/tag")
 	logPackets := flag.Bool("log-packets", false, "log received packets")
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
@@ -984,6 +995,9 @@ func main() {
 		Interval:          *directoryPublishInterval,
 		TTL:               *directoryTTL,
 		RequestAllowCIDRs: *directoryRequestAllowCIDRs,
+		DynamicClients:    *directoryDynamicClients,
+		ClientTTL:         *directoryClientTTL,
+		ClientAllowCIDRs:  *directoryClientAllowCIDRs,
 		Participants:      srv.directoryParticipants,
 	})
 	if err != nil {
@@ -991,9 +1005,12 @@ func main() {
 	}
 	if directoryPublisher != nil {
 		defer directoryPublisher.Close()
-		log.Printf("PSK directory enabled: target=%s listen=%s interval=%s ttl=%s", *directoryUDPTarget, *directoryUDPListen, *directoryPublishInterval, *directoryTTL)
+		log.Printf("PSK directory enabled: target=%s listen=%s interval=%s ttl=%s dynamic_clients=%t client_ttl=%s", *directoryUDPTarget, *directoryUDPListen, *directoryPublishInterval, *directoryTTL, *directoryDynamicClients, *directoryClientTTL)
 		if len(directoryPublisher.allowed) == 0 {
 			log.Printf("PSK directory request source CIDR filtering is disabled; configure -directory-request-allow-cidrs to reduce unauthenticated UDP load")
+		}
+		if *directoryDynamicClients && len(directoryPublisher.clientAllowed) == 0 {
+			log.Printf("PSK directory dynamic client source CIDR filtering is disabled; configure -directory-client-allow-cidrs to reduce unauthenticated UDP load")
 		}
 		go directoryPublisher.Run()
 	}

@@ -32,18 +32,22 @@ const (
 	directoryEnvelopeSnapshot     = "snapshot"
 	directoryEnvelopeParticipants = "participants"
 	directoryEnvelopeRequest      = "request"
+	directoryEnvelopeRegister     = "register"
+	directoryEnvelopeHeartbeat    = "heartbeat"
 	directoryPSKBytes             = 32
 	directoryEpochBytes           = 16
 	directoryMaxDatagramBytes     = 1200
 	directoryMaxChannels          = 256
 	directoryMaxSpeakers          = 4096
 	directoryMaxParticipants      = 128
+	directoryMaxClients           = 64
 	directoryMaxNameRunes         = 128
 	directoryMaxKeyIDBytes        = 64
 	directoryMaxValidity          = 5 * time.Minute
 	directoryDefaultKeyID         = "pwa-1"
 	directoryDefaultInterval      = 30 * time.Second
 	directoryDefaultTTL           = 90 * time.Second
+	directoryDefaultClientTTL     = 90 * time.Second
 	directoryRequestTTL           = 30 * time.Second
 	directoryKeyDerivationLabel   = "IncomUdon directory PSK v1 relay-to-pwa"
 	directoryAllChannels          = "all"
@@ -93,6 +97,16 @@ type directoryRequest struct {
 	ExpiresAt int64 `json:"expiresAt"`
 }
 
+// directoryRegistration identifies a PWA or native directory consumer without
+// carrying an address. The Relay always records the authenticated UDP source
+// address rather than trusting anything supplied in this payload.
+type directoryRegistration struct {
+	Version    int    `json:"version"`
+	InstanceID string `json:"instanceId"`
+	IssuedAt   int64  `json:"issuedAt"`
+	ExpiresAt  int64  `json:"expiresAt"`
+}
+
 type directoryEnvelope struct {
 	Version    int    `json:"v"`
 	Type       string `json:"type"`
@@ -114,25 +128,38 @@ type directoryPublisherConfig struct {
 	Interval          time.Duration
 	TTL               time.Duration
 	RequestAllowCIDRs string
+	DynamicClients    bool
+	ClientTTL         time.Duration
+	ClientAllowCIDRs  string
 	Participants      func() []directoryParticipant
 }
 
+type directoryRegisteredClient struct {
+	Address   *net.UDPAddr
+	ExpiresAt time.Time
+}
+
 type directoryPublisher struct {
-	channelsCSV  string
-	speakersCSV  string
-	conn         *net.UDPConn
-	target       *net.UDPAddr
-	psk          []byte
-	keyID        string
-	epoch        []byte
-	interval     time.Duration
-	ttl          time.Duration
-	allowed      []*net.IPNet
-	participants func() []directoryParticipant
-	sequenceMu   sync.Mutex
-	sequence     uint64
-	replayMu     sync.Mutex
-	replay       map[string]directoryReplayState
+	channelsCSV   string
+	speakersCSV   string
+	conn          *net.UDPConn
+	target        *net.UDPAddr
+	psk           []byte
+	keyID         string
+	epoch         []byte
+	interval      time.Duration
+	ttl           time.Duration
+	allowed       []*net.IPNet
+	dynamic       bool
+	clientTTL     time.Duration
+	clientAllowed []*net.IPNet
+	participants  func() []directoryParticipant
+	sequenceMu    sync.Mutex
+	sequence      uint64
+	replayMu      sync.Mutex
+	replay        map[string]directoryReplayState
+	clientsMu     sync.Mutex
+	clients       map[string]directoryRegisteredClient
 }
 
 type directoryReplayState struct {
@@ -154,8 +181,11 @@ func newDirectoryPublisher(config directoryPublisherConfig) (*directoryPublisher
 	if !config.Enabled {
 		return nil, nil
 	}
-	if config.ChannelsCSV == "" || config.SpeakersCSV == "" || config.Target == "" || config.ListenAddress == "" || config.PSKFile == "" {
-		return nil, fmt.Errorf("directory publishing requires channels CSV, speakers CSV, UDP target, UDP listen address, and PSK file")
+	if config.ChannelsCSV == "" || config.SpeakersCSV == "" || config.ListenAddress == "" || config.PSKFile == "" {
+		return nil, fmt.Errorf("directory publishing requires channels CSV, speakers CSV, UDP listen address, and PSK file")
+	}
+	if config.Target == "" && !config.DynamicClients {
+		return nil, fmt.Errorf("directory publishing requires a UDP target unless dynamic clients are enabled")
 	}
 	if err := validateDirectoryKeyID(config.KeyID); err != nil {
 		return nil, err
@@ -172,16 +202,29 @@ func newDirectoryPublisher(config directoryPublisherConfig) (*directoryPublisher
 	if config.TTL < 5*time.Second || config.TTL > directoryMaxValidity {
 		return nil, fmt.Errorf("directory TTL must be between 5s and %s", directoryMaxValidity)
 	}
+	if config.ClientTTL <= 0 {
+		config.ClientTTL = directoryDefaultClientTTL
+	}
+	if config.ClientTTL < 5*time.Second || config.ClientTTL > directoryMaxValidity {
+		return nil, fmt.Errorf("directory client TTL must be between 5s and %s", directoryMaxValidity)
+	}
 
 	psk, err := loadDirectoryPSK(config.PSKFile)
 	if err != nil {
 		return nil, err
 	}
-	target, err := net.ResolveUDPAddr("udp", config.Target)
-	if err != nil {
-		return nil, fmt.Errorf("resolve directory UDP target: %w", err)
+	var target *net.UDPAddr
+	if config.Target != "" {
+		target, err = net.ResolveUDPAddr("udp", config.Target)
+		if err != nil {
+			return nil, fmt.Errorf("resolve directory UDP target: %w", err)
+		}
 	}
 	allowed, err := parseDirectoryAllowCIDRs(config.RequestAllowCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	clientAllowed, err := parseDirectoryAllowCIDRs(config.ClientAllowCIDRs)
 	if err != nil {
 		return nil, err
 	}
@@ -200,18 +243,22 @@ func newDirectoryPublisher(config directoryPublisherConfig) (*directoryPublisher
 	}
 
 	return &directoryPublisher{
-		channelsCSV:  config.ChannelsCSV,
-		speakersCSV:  config.SpeakersCSV,
-		conn:         conn,
-		target:       target,
-		psk:          psk,
-		keyID:        config.KeyID,
-		epoch:        epoch,
-		interval:     config.Interval,
-		ttl:          config.TTL,
-		allowed:      allowed,
-		participants: config.Participants,
-		replay:       make(map[string]directoryReplayState),
+		channelsCSV:   config.ChannelsCSV,
+		speakersCSV:   config.SpeakersCSV,
+		conn:          conn,
+		target:        target,
+		psk:           psk,
+		keyID:         config.KeyID,
+		epoch:         epoch,
+		interval:      config.Interval,
+		ttl:           config.TTL,
+		allowed:       allowed,
+		dynamic:       config.DynamicClients,
+		clientTTL:     config.ClientTTL,
+		clientAllowed: clientAllowed,
+		participants:  config.Participants,
+		replay:        make(map[string]directoryReplayState),
+		clients:       make(map[string]directoryRegisteredClient),
 	}, nil
 }
 
@@ -227,11 +274,11 @@ func (p *directoryPublisher) Run() {
 		return
 	}
 	go p.serveRequests()
-	p.publishTo(p.target, "periodic")
+	p.publishAll("startup")
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		p.publishTo(p.target, "periodic")
+		p.publishAll("periodic")
 	}
 }
 
@@ -249,14 +296,53 @@ func (p *directoryPublisher) serveRequests() {
 			}
 			return
 		}
-		if n > directoryMaxDatagramBytes || !p.sourceAllowed(source) {
+		if n > directoryMaxDatagramBytes {
 			continue
 		}
-		if err := p.openRequest(buffer[:n]); err != nil {
-			log.Printf("directory request rejected from %s: %v", source, err)
+		envelopeType, err := directoryPacketEnvelopeType(buffer[:n])
+		if err != nil {
 			continue
 		}
-		p.publishTo(source, "pull")
+		switch envelopeType {
+		case directoryEnvelopeRequest:
+			if !p.sourceAllowed(source) {
+				continue
+			}
+			if err := p.openRequest(buffer[:n]); err != nil {
+				log.Printf("directory request rejected from %s: %v", source, err)
+				continue
+			}
+			p.publishTo(source, "pull")
+
+		case directoryEnvelopeRegister, directoryEnvelopeHeartbeat:
+			if !p.dynamic || !p.clientSourceAllowed(source) {
+				continue
+			}
+			registration, err := p.openRegistration(buffer[:n], envelopeType)
+			if err != nil {
+				log.Printf("directory client %s rejected from %s: %v", envelopeType, source, err)
+				continue
+			}
+			if p.registerClient(registration, source) {
+				p.publishTo(source, "register")
+			}
+		}
+	}
+}
+
+func (p *directoryPublisher) publishAll(reason string) {
+	if p == nil {
+		return
+	}
+	targets := make(map[string]*net.UDPAddr)
+	if p.target != nil {
+		targets[p.target.String()] = p.target
+	}
+	for _, target := range p.activeClientTargets(time.Now()) {
+		targets[target.String()] = target
+	}
+	for _, target := range targets {
+		p.publishTo(target, reason)
 	}
 }
 
@@ -394,6 +480,34 @@ func (p *directoryPublisher) openRequest(packet []byte) error {
 	return nil
 }
 
+func (p *directoryPublisher) openRegistration(packet []byte, envelopeType string) (directoryRegistration, error) {
+	if envelopeType != directoryEnvelopeRegister && envelopeType != directoryEnvelopeHeartbeat {
+		return directoryRegistration{}, fmt.Errorf("invalid directory client envelope type")
+	}
+	envelope, plaintext, err := openDirectoryEnvelope(p.psk, p.keyID, packet, envelopeType)
+	if err != nil {
+		return directoryRegistration{}, err
+	}
+	now := time.Now()
+	if envelope.ExpiresAt <= now.Unix() || envelope.ExpiresAt > now.Add(directoryRequestTTL).Unix() {
+		return directoryRegistration{}, fmt.Errorf("expired or excessive client registration validity")
+	}
+	var registration directoryRegistration
+	if err := decodeDirectoryJSON(plaintext, &registration); err != nil {
+		return directoryRegistration{}, fmt.Errorf("invalid client registration: %w", err)
+	}
+	if registration.Version != directoryProtocolVersion || registration.ExpiresAt != envelope.ExpiresAt || registration.IssuedAt > now.Add(30*time.Second).Unix() || registration.IssuedAt < now.Add(-directoryRequestTTL).Unix() || registration.ExpiresAt <= registration.IssuedAt {
+		return directoryRegistration{}, fmt.Errorf("invalid client registration metadata")
+	}
+	if err := validateDirectoryInstanceID(registration.InstanceID); err != nil {
+		return directoryRegistration{}, err
+	}
+	if !p.acceptRequestSequence(envelope, now.Unix()) {
+		return directoryRegistration{}, fmt.Errorf("replayed client registration")
+	}
+	return registration, nil
+}
+
 func openDirectoryEnvelope(psk []byte, keyID string, packet []byte, expectedType string) (directoryEnvelope, []byte, error) {
 	var envelope directoryEnvelope
 	if err := decodeDirectoryJSON(packet, &envelope); err != nil {
@@ -456,11 +570,87 @@ func (p *directoryPublisher) acceptRequestSequence(envelope directoryEnvelope, n
 	return true
 }
 
+// registerClient returns true when the registration is new or the observed UDP
+// endpoint changed. Only those transitions trigger an immediate snapshot; later
+// heartbeats are served by the normal periodic publisher.
+func (p *directoryPublisher) registerClient(registration directoryRegistration, source *net.UDPAddr) bool {
+	if p == nil || source == nil || source.IP == nil || source.Port <= 0 {
+		return false
+	}
+	key := p.keyID + ":" + registration.InstanceID
+	now := time.Now()
+	address := cloneDirectoryUDPAddr(source)
+	p.clientsMu.Lock()
+	defer p.clientsMu.Unlock()
+	for clientKey, client := range p.clients {
+		if !client.ExpiresAt.After(now) {
+			delete(p.clients, clientKey)
+		}
+	}
+	previous, exists := p.clients[key]
+	if !exists && len(p.clients) >= directoryMaxClients {
+		oldestKey := ""
+		var oldestExpiry time.Time
+		for clientKey, client := range p.clients {
+			if oldestKey == "" || client.ExpiresAt.Before(oldestExpiry) {
+				oldestKey = clientKey
+				oldestExpiry = client.ExpiresAt
+			}
+		}
+		delete(p.clients, oldestKey)
+	}
+	p.clients[key] = directoryRegisteredClient{Address: address, ExpiresAt: now.Add(p.clientTTL)}
+	return !exists || !directoryUDPAddrEqual(previous.Address, address)
+}
+
+func (p *directoryPublisher) activeClientTargets(now time.Time) []*net.UDPAddr {
+	if p == nil || !p.dynamic {
+		return nil
+	}
+	p.clientsMu.Lock()
+	defer p.clientsMu.Unlock()
+	targets := make([]*net.UDPAddr, 0, len(p.clients))
+	for key, client := range p.clients {
+		if !client.ExpiresAt.After(now) {
+			delete(p.clients, key)
+			continue
+		}
+		targets = append(targets, cloneDirectoryUDPAddr(client.Address))
+	}
+	return targets
+}
+
+func cloneDirectoryUDPAddr(address *net.UDPAddr) *net.UDPAddr {
+	if address == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: address.Port, Zone: address.Zone}
+}
+
+func directoryUDPAddrEqual(left, right *net.UDPAddr) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Port == right.Port && left.Zone == right.Zone && left.IP.Equal(right.IP)
+}
+
 func (p *directoryPublisher) sourceAllowed(source *net.UDPAddr) bool {
 	if len(p.allowed) == 0 || source == nil {
 		return source != nil
 	}
 	for _, cidr := range p.allowed {
+		if cidr.Contains(source.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *directoryPublisher) clientSourceAllowed(source *net.UDPAddr) bool {
+	if len(p.clientAllowed) == 0 || source == nil {
+		return source != nil
+	}
+	for _, cidr := range p.clientAllowed {
 		if cidr.Contains(source.IP) {
 			return true
 		}
@@ -497,9 +687,20 @@ func decodeDirectoryJSON(payload []byte, destination any) error {
 	return nil
 }
 
+func directoryPacketEnvelopeType(packet []byte) (string, error) {
+	var envelope directoryEnvelope
+	if err := decodeDirectoryJSON(packet, &envelope); err != nil {
+		return "", fmt.Errorf("invalid envelope: %w", err)
+	}
+	if envelope.Version != directoryProtocolVersion || !isDirectoryEnvelopeType(envelope.Type) {
+		return "", fmt.Errorf("unsupported envelope")
+	}
+	return envelope.Type, nil
+}
+
 func isDirectoryEnvelopeType(value string) bool {
 	switch value {
-	case directoryEnvelopeSnapshot, directoryEnvelopeParticipants, directoryEnvelopeRequest:
+	case directoryEnvelopeSnapshot, directoryEnvelopeParticipants, directoryEnvelopeRequest, directoryEnvelopeRegister, directoryEnvelopeHeartbeat:
 		return true
 	default:
 		return false
@@ -769,6 +970,14 @@ func validateDirectoryKeyID(keyID string) error {
 			continue
 		}
 		return fmt.Errorf("directory key ID contains unsupported characters")
+	}
+	return nil
+}
+
+func validateDirectoryInstanceID(instanceID string) error {
+	decoded, err := base64.RawURLEncoding.DecodeString(instanceID)
+	if err != nil || len(decoded) != directoryEpochBytes {
+		return fmt.Errorf("invalid directory client instance ID")
 	}
 	return nil
 }

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -109,6 +111,38 @@ func TestDirectoryPublisherRequiresExplicitEnablement(t *testing.T) {
 	}
 }
 
+func TestDirectoryPublisherAllowsDynamicClientsWithoutStaticTarget(t *testing.T) {
+	dir := t.TempDir()
+	channelsPath := filepath.Join(dir, "channels.csv")
+	speakersPath := filepath.Join(dir, "speakers.csv")
+	pskPath := filepath.Join(dir, "directory.psk")
+	if err := os.WriteFile(channelsPath, []byte("101,Operations\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(speakersPath, []byte("101,1001,Dispatch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	psk := []byte("01234567890123456789012345678901")
+	if err := os.WriteFile(pskPath, []byte(base64.RawURLEncoding.EncodeToString(psk)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := newDirectoryPublisher(directoryPublisherConfig{
+		Enabled:        true,
+		DynamicClients: true,
+		ChannelsCSV:    channelsPath,
+		SpeakersCSV:    speakersPath,
+		ListenAddress:  "127.0.0.1:0",
+		PSKFile:        pskPath,
+	})
+	if err != nil {
+		t.Fatalf("newDirectoryPublisher() error = %v", err)
+	}
+	defer publisher.Close()
+	if publisher.target != nil || !publisher.dynamic {
+		t.Fatalf("publisher = %#v, want dynamic client-only delivery", publisher)
+	}
+}
+
 func TestDirectoryParticipantsExcludesAddressesAndSorts(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	srv := &server{
@@ -172,5 +206,67 @@ func TestDirectoryPublisherAcceptsAuthenticatedPullOnce(t *testing.T) {
 	}
 	if err := publisher.openRequest(packet); err == nil {
 		t.Fatal("openRequest() accepted replayed request")
+	}
+}
+
+func TestDirectoryPublisherRegistersDynamicClientFromObservedEndpoint(t *testing.T) {
+	psk := []byte("01234567890123456789012345678901")
+	now := time.Now()
+	registration := directoryRegistration{
+		Version:    directoryProtocolVersion,
+		InstanceID: base64.RawURLEncoding.EncodeToString([]byte("client-instance!")),
+		IssuedAt:   now.Unix(),
+		ExpiresAt:  now.Add(10 * time.Second).Unix(),
+	}
+	payload, err := json.Marshal(registration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := sealDirectoryEnvelope(psk, "pwa-1", []byte("directory-epoch!"), 1, registration.ExpiresAt, payload, directoryEnvelopeRegister)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &directoryPublisher{
+		psk:       psk,
+		keyID:     "pwa-1",
+		dynamic:   true,
+		clientTTL: time.Minute,
+		replay:    make(map[string]directoryReplayState),
+		clients:   make(map[string]directoryRegisteredClient),
+	}
+	got, err := publisher.openRegistration(packet, directoryEnvelopeRegister)
+	if err != nil {
+		t.Fatalf("openRegistration() error = %v", err)
+	}
+	firstSource := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 44000}
+	if !publisher.registerClient(got, firstSource) {
+		t.Fatal("first registration did not request an immediate snapshot")
+	}
+	targets := publisher.activeClientTargets(time.Now())
+	if len(targets) != 1 || !directoryUDPAddrEqual(targets[0], firstSource) {
+		t.Fatalf("registered targets = %#v, want %#v", targets, firstSource)
+	}
+
+	envelope, err = sealDirectoryEnvelope(psk, "pwa-1", []byte("directory-epoch!"), 2, registration.ExpiresAt, payload, directoryEnvelopeHeartbeat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err = json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = publisher.openRegistration(packet, directoryEnvelopeHeartbeat)
+	if err != nil {
+		t.Fatalf("openRegistration(heartbeat) error = %v", err)
+	}
+	if publisher.registerClient(got, firstSource) {
+		t.Fatal("unchanged heartbeat requested an unnecessary immediate snapshot")
+	}
+	if !publisher.registerClient(got, &net.UDPAddr{IP: firstSource.IP, Port: 44001}) {
+		t.Fatal("endpoint change did not request an immediate snapshot")
 	}
 }
