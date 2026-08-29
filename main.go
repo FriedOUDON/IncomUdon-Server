@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	protocolVersion    = 1
-	fixedHeaderSize    = 16
-	securityHeaderSize = 12
-	authTagSize        = 16
+	protocolVersion                    = 1
+	fixedHeaderSize                    = 16
+	securityHeaderSize                 = 12
+	authTagSize                        = 16
+	packetFlagAESGCMV2HeaderAAD uint16 = 1 << 0
 )
 
 const (

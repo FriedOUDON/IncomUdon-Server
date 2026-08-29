@@ -134,3 +134,40 @@ func TestFecRequiresActiveTalker(t *testing.T) {
 		t.Fatalf("expected FEC packet, got type=%d", forwarded.Header.Type)
 	}
 }
+
+func TestForwardsAESGCMV2MediaPacketWithoutChangingAuthenticatedHeader(t *testing.T) {
+	relay := newTestUDPConn(t)
+	sender := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 44
+	const senderID uint32 = 4001
+
+	s := newServer(relay, false, false, false, 0, true, 2)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			"sender":   {addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID},
+			"listener": {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 4002},
+		},
+		activeTalkers: map[uint32]time.Time{senderID: time.Now()},
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	// The Relay does not decrypt media. It must preserve the v2 AAD bytes
+	// exactly so receivers can authenticate the forwarded packet.
+	raw := buildControlPacket(pktAudio, channelID, senderID, []byte{1, 2, 3}, false)
+	raw[14] = byte(packetFlagAESGCMV2HeaderAAD >> 8)
+	raw[15] = byte(packetFlagAESGCMV2HeaderAAD)
+	packet, ok := parsePacket(raw, false)
+	if !ok {
+		t.Fatal("failed to parse v2 media packet")
+	}
+	s.handlePacket(packet, sender.LocalAddr().(*net.UDPAddr))
+
+	forwarded := receiveTestPacket(t, listener)
+	if forwarded.Header.Flags&packetFlagAESGCMV2HeaderAAD == 0 {
+		t.Fatal("Relay removed AES-GCM-v2 header-authentication flag")
+	}
+	if string(forwarded.Raw) != string(raw) {
+		t.Fatal("Relay modified v2 media packet bytes")
+	}
+}
