@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -21,26 +22,31 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
 const (
-	directoryProtocolVersion    = 1
-	directoryEnvelopeSnapshot   = "snapshot"
-	directoryPSKBytes           = 32
-	directoryEpochBytes         = 16
-	directoryMaxDatagramBytes   = 1200
-	directoryMaxChannels        = 256
-	directoryMaxSpeakers        = 4096
-	directoryMaxNameRunes       = 128
-	directoryMaxKeyIDBytes      = 64
-	directoryMaxValidity        = 5 * time.Minute
-	directoryDefaultKeyID       = "pwa-1"
-	directoryDefaultInterval    = 30 * time.Second
-	directoryDefaultTTL         = 90 * time.Second
-	directoryKeyDerivationLabel = "IncomUdon directory PSK v1 relay-to-pwa"
-	directoryAllChannels        = "all"
+	directoryProtocolVersion      = 1
+	directoryEnvelopeSnapshot     = "snapshot"
+	directoryEnvelopeParticipants = "participants"
+	directoryEnvelopeRequest      = "request"
+	directoryPSKBytes             = 32
+	directoryEpochBytes           = 16
+	directoryMaxDatagramBytes     = 1200
+	directoryMaxChannels          = 256
+	directoryMaxSpeakers          = 4096
+	directoryMaxParticipants      = 128
+	directoryMaxNameRunes         = 128
+	directoryMaxKeyIDBytes        = 64
+	directoryMaxValidity          = 5 * time.Minute
+	directoryDefaultKeyID         = "pwa-1"
+	directoryDefaultInterval      = 30 * time.Second
+	directoryDefaultTTL           = 90 * time.Second
+	directoryRequestTTL           = 30 * time.Second
+	directoryKeyDerivationLabel   = "IncomUdon directory PSK v1 relay-to-pwa"
+	directoryAllChannels          = "all"
 )
 
 type directoryChannel struct {
@@ -63,6 +69,30 @@ type directoryDocument struct {
 	Speakers  []directorySpeaker `json:"speakers"`
 }
 
+// directoryParticipant intentionally omits network addresses and cryptographic
+// material. It is safe to provision to an authenticated UI or a future native
+// client while still describing who is currently present on a channel.
+type directoryParticipant struct {
+	ChannelID  uint32 `json:"channelId"`
+	SenderID   uint32 `json:"senderId"`
+	LastSeenAt int64  `json:"lastSeenAt"`
+	Talking    bool   `json:"talking"`
+}
+
+type directoryParticipantsDocument struct {
+	Version      int                    `json:"version"`
+	Revision     string                 `json:"revision"`
+	IssuedAt     int64                  `json:"issuedAt"`
+	ExpiresAt    int64                  `json:"expiresAt"`
+	Participants []directoryParticipant `json:"participants"`
+}
+
+type directoryRequest struct {
+	Version   int   `json:"version"`
+	IssuedAt  int64 `json:"issuedAt"`
+	ExpiresAt int64 `json:"expiresAt"`
+}
+
 type directoryEnvelope struct {
 	Version    int    `json:"v"`
 	Type       string `json:"type"`
@@ -74,43 +104,58 @@ type directoryEnvelope struct {
 }
 
 type directoryPublisherConfig struct {
-	ChannelsCSV string
-	SpeakersCSV string
-	Target      string
-	PSKFile     string
-	KeyID       string
-	Interval    time.Duration
-	TTL         time.Duration
+	Enabled           bool
+	ChannelsCSV       string
+	SpeakersCSV       string
+	Target            string
+	ListenAddress     string
+	PSKFile           string
+	KeyID             string
+	Interval          time.Duration
+	TTL               time.Duration
+	RequestAllowCIDRs string
+	Participants      func() []directoryParticipant
 }
 
 type directoryPublisher struct {
-	channelsCSV string
-	speakersCSV string
-	conn        *net.UDPConn
-	psk         []byte
-	keyID       string
-	epoch       []byte
-	interval    time.Duration
-	ttl         time.Duration
-	sequence    uint64
+	channelsCSV  string
+	speakersCSV  string
+	conn         *net.UDPConn
+	target       *net.UDPAddr
+	psk          []byte
+	keyID        string
+	epoch        []byte
+	interval     time.Duration
+	ttl          time.Duration
+	allowed      []*net.IPNet
+	participants func() []directoryParticipant
+	sequenceMu   sync.Mutex
+	sequence     uint64
+	replayMu     sync.Mutex
+	replay       map[string]directoryReplayState
+}
+
+type directoryReplayState struct {
+	Sequence  uint64
+	ExpiresAt int64
 }
 
 func newDirectoryPublisher(config directoryPublisherConfig) (*directoryPublisher, error) {
 	config.ChannelsCSV = strings.TrimSpace(config.ChannelsCSV)
 	config.SpeakersCSV = strings.TrimSpace(config.SpeakersCSV)
 	config.Target = strings.TrimSpace(config.Target)
+	config.ListenAddress = strings.TrimSpace(config.ListenAddress)
 	config.PSKFile = strings.TrimSpace(config.PSKFile)
 	config.KeyID = strings.TrimSpace(config.KeyID)
 	if config.KeyID == "" {
 		config.KeyID = directoryDefaultKeyID
 	}
 
-	configured := config.ChannelsCSV != "" || config.SpeakersCSV != "" || config.Target != "" || config.PSKFile != ""
-	if !configured {
+	if !config.Enabled {
 		return nil, nil
 	}
-	if config.ChannelsCSV == "" || config.SpeakersCSV == "" || config.Target == "" || config.PSKFile == "" {
-		return nil, fmt.Errorf("directory publishing requires channels CSV, speakers CSV, UDP target, and PSK file")
+	if config.ChannelsCSV == "" || config.SpeakersCSV == "" || config.Target == "" || config.ListenAddress == "" || config.PSKFile == "" {
+		return nil, fmt.Errorf("directory publishing requires channels CSV, speakers CSV, UDP target, UDP listen address, and PSK file")
 	}
 	if err := validateDirectoryKeyID(config.KeyID); err != nil {
 		return nil, err
@@ -136,9 +181,17 @@ func newDirectoryPublisher(config directoryPublisherConfig) (*directoryPublisher
 	if err != nil {
 		return nil, fmt.Errorf("resolve directory UDP target: %w", err)
 	}
-	conn, err := net.DialUDP("udp", nil, target)
+	allowed, err := parseDirectoryAllowCIDRs(config.RequestAllowCIDRs)
 	if err != nil {
-		return nil, fmt.Errorf("dial directory UDP target: %w", err)
+		return nil, err
+	}
+	listenAddress, err := net.ResolveUDPAddr("udp", config.ListenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("resolve directory UDP listener: %w", err)
+	}
+	conn, err := net.ListenUDP("udp", listenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("listen for directory UDP: %w", err)
 	}
 	epoch := make([]byte, directoryEpochBytes)
 	if _, err := rand.Read(epoch); err != nil {
@@ -147,14 +200,18 @@ func newDirectoryPublisher(config directoryPublisherConfig) (*directoryPublisher
 	}
 
 	return &directoryPublisher{
-		channelsCSV: config.ChannelsCSV,
-		speakersCSV: config.SpeakersCSV,
-		conn:        conn,
-		psk:         psk,
-		keyID:       config.KeyID,
-		epoch:       epoch,
-		interval:    config.Interval,
-		ttl:         config.TTL,
+		channelsCSV:  config.ChannelsCSV,
+		speakersCSV:  config.SpeakersCSV,
+		conn:         conn,
+		target:       target,
+		psk:          psk,
+		keyID:        config.KeyID,
+		epoch:        epoch,
+		interval:     config.Interval,
+		ttl:          config.TTL,
+		allowed:      allowed,
+		participants: config.Participants,
+		replay:       make(map[string]directoryReplayState),
 	}, nil
 }
 
@@ -169,56 +226,129 @@ func (p *directoryPublisher) Run() {
 	if p == nil {
 		return
 	}
-	p.publish()
+	go p.serveRequests()
+	p.publishTo(p.target, "periodic")
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		p.publish()
+		p.publishTo(p.target, "periodic")
 	}
 }
 
-func (p *directoryPublisher) publish() {
+func (p *directoryPublisher) serveRequests() {
+	if p == nil || p.conn == nil {
+		return
+	}
+	buffer := make([]byte, directoryMaxDatagramBytes+1)
+	for {
+		n, source, err := p.conn.ReadFromUDP(buffer)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+				log.Printf("directory request read error: %v", err)
+				continue
+			}
+			return
+		}
+		if n > directoryMaxDatagramBytes || !p.sourceAllowed(source) {
+			continue
+		}
+		if err := p.openRequest(buffer[:n]); err != nil {
+			log.Printf("directory request rejected from %s: %v", source, err)
+			continue
+		}
+		p.publishTo(source, "pull")
+	}
+}
+
+func (p *directoryPublisher) publishTo(target *net.UDPAddr, reason string) {
+	if p == nil || p.conn == nil || target == nil {
+		return
+	}
 	now := time.Now()
 	document, err := loadDirectoryDocument(p.channelsCSV, p.speakersCSV, now, p.ttl)
 	if err != nil {
-		log.Printf("directory snapshot skipped: %v", err)
+		log.Printf("directory snapshot skipped (%s): %v", reason, err)
 		return
 	}
-	payload, err := json.Marshal(document)
-	if err != nil {
-		log.Printf("directory snapshot skipped: marshal payload: %v", err)
+	if err := p.writeDocument(target, directoryEnvelopeSnapshot, document.ExpiresAt, document, reason); err != nil {
+		log.Printf("directory snapshot skipped (%s): %v", reason, err)
 		return
 	}
 
-	p.sequence++
-	envelope, err := sealDirectoryEnvelope(p.psk, p.keyID, p.epoch, p.sequence, document.ExpiresAt, payload)
-	if err != nil {
-		log.Printf("directory snapshot skipped: encrypt payload: %v", err)
+	participants := make([]directoryParticipant, 0)
+	if p.participants != nil {
+		participants = p.participants()
+	}
+	if len(participants) > directoryMaxParticipants {
+		log.Printf("directory participants skipped (%s): %d participants exceeds maximum %d", reason, len(participants), directoryMaxParticipants)
 		return
+	}
+	for _, participant := range participants {
+		if participant.ChannelID == 0 || participant.SenderID == 0 || participant.LastSeenAt <= 0 {
+			log.Printf("directory participants skipped (%s): invalid participant snapshot", reason)
+			return
+		}
+	}
+	participantDocument := directoryParticipantsDocument{
+		Version:      directoryProtocolVersion,
+		IssuedAt:     now.Unix(),
+		ExpiresAt:    now.Add(p.ttl).Unix(),
+		Participants: participants,
+	}
+	participantDocument.Revision = directoryParticipantsDocumentRevision(participantDocument)
+	if err := p.writeDocument(target, directoryEnvelopeParticipants, participantDocument.ExpiresAt, participantDocument, reason); err != nil {
+		log.Printf("directory participants skipped (%s): %v", reason, err)
+	}
+}
+
+func (p *directoryPublisher) writeDocument(target *net.UDPAddr, envelopeType string, expiresAt int64, document any, reason string) error {
+	payload, err := json.Marshal(document)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	sequence := p.nextSequence()
+	envelope, err := sealDirectoryEnvelope(p.psk, p.keyID, p.epoch, sequence, expiresAt, payload, envelopeType)
+	if err != nil {
+		return fmt.Errorf("encrypt payload: %w", err)
 	}
 	packet, err := json.Marshal(envelope)
 	if err != nil {
-		log.Printf("directory snapshot skipped: marshal envelope: %v", err)
-		return
+		return fmt.Errorf("marshal envelope: %w", err)
 	}
 	if len(packet) > directoryMaxDatagramBytes {
-		log.Printf("directory snapshot skipped: packet is %d bytes (maximum %d); shorten names or split the directory", len(packet), directoryMaxDatagramBytes)
-		return
+		return fmt.Errorf("packet is %d bytes (maximum %d)", len(packet), directoryMaxDatagramBytes)
 	}
-	if _, err := p.conn.Write(packet); err != nil {
-		log.Printf("directory snapshot send failed: %v", err)
-		return
+	if _, err := p.conn.WriteToUDP(packet, target); err != nil {
+		return fmt.Errorf("send failed: %w", err)
 	}
-	log.Printf("directory snapshot sent: revision=%s channels=%d speakers=%d bytes=%d", document.Revision[:12], len(document.Channels), len(document.Speakers), len(packet))
+	switch typed := document.(type) {
+	case directoryDocument:
+		log.Printf("directory snapshot sent: reason=%s revision=%s channels=%d speakers=%d bytes=%d", reason, typed.Revision[:12], len(typed.Channels), len(typed.Speakers), len(packet))
+	case directoryParticipantsDocument:
+		log.Printf("directory participants sent: reason=%s revision=%s participants=%d bytes=%d", reason, typed.Revision[:12], len(typed.Participants), len(packet))
+	}
+	return nil
 }
 
-func sealDirectoryEnvelope(psk []byte, keyID string, epoch []byte, sequence uint64, expiresAt int64, payload []byte) (directoryEnvelope, error) {
+func (p *directoryPublisher) nextSequence() uint64 {
+	p.sequenceMu.Lock()
+	p.sequence++
+	sequence := p.sequence
+	p.sequenceMu.Unlock()
+	return sequence
+}
+
+func sealDirectoryEnvelope(psk []byte, keyID string, epoch []byte, sequence uint64, expiresAt int64, payload []byte, envelopeType string) (directoryEnvelope, error) {
 	if len(epoch) != directoryEpochBytes {
 		return directoryEnvelope{}, fmt.Errorf("invalid directory epoch")
 	}
+	if !isDirectoryEnvelopeType(envelopeType) {
+		return directoryEnvelope{}, fmt.Errorf("invalid directory envelope type")
+	}
 	envelope := directoryEnvelope{
 		Version:   directoryProtocolVersion,
-		Type:      directoryEnvelopeSnapshot,
+		Type:      envelopeType,
 		KeyID:     keyID,
 		Epoch:     base64.RawURLEncoding.EncodeToString(epoch),
 		Sequence:  sequence,
@@ -242,6 +372,140 @@ func sealDirectoryEnvelope(psk []byte, keyID string, epoch []byte, sequence uint
 	return envelope, nil
 }
 
+func (p *directoryPublisher) openRequest(packet []byte) error {
+	envelope, plaintext, err := openDirectoryEnvelope(p.psk, p.keyID, packet, directoryEnvelopeRequest)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if envelope.ExpiresAt <= now.Unix() || envelope.ExpiresAt > now.Add(directoryRequestTTL).Unix() {
+		return fmt.Errorf("expired or excessive request validity")
+	}
+	var request directoryRequest
+	if err := decodeDirectoryJSON(plaintext, &request); err != nil {
+		return fmt.Errorf("invalid request: %w", err)
+	}
+	if request.Version != directoryProtocolVersion || request.ExpiresAt != envelope.ExpiresAt || request.IssuedAt > now.Add(30*time.Second).Unix() || request.IssuedAt < now.Add(-directoryRequestTTL).Unix() || request.ExpiresAt <= request.IssuedAt {
+		return fmt.Errorf("invalid request metadata")
+	}
+	if !p.acceptRequestSequence(envelope, now.Unix()) {
+		return fmt.Errorf("replayed request")
+	}
+	return nil
+}
+
+func openDirectoryEnvelope(psk []byte, keyID string, packet []byte, expectedType string) (directoryEnvelope, []byte, error) {
+	var envelope directoryEnvelope
+	if err := decodeDirectoryJSON(packet, &envelope); err != nil {
+		return directoryEnvelope{}, nil, fmt.Errorf("invalid envelope: %w", err)
+	}
+	if envelope.Version != directoryProtocolVersion || envelope.Type != expectedType || envelope.KeyID != keyID || envelope.Sequence == 0 {
+		return directoryEnvelope{}, nil, fmt.Errorf("unsupported envelope")
+	}
+	epoch, err := base64.RawURLEncoding.DecodeString(envelope.Epoch)
+	if err != nil || len(epoch) != directoryEpochBytes {
+		return directoryEnvelope{}, nil, fmt.Errorf("invalid envelope epoch")
+	}
+	ciphertext, err := base64.RawURLEncoding.DecodeString(envelope.Ciphertext)
+	if err != nil || len(ciphertext) < aes.BlockSize+16 {
+		return directoryEnvelope{}, nil, fmt.Errorf("invalid envelope ciphertext")
+	}
+	block, err := aes.NewCipher(deriveDirectoryKey(psk, epoch))
+	if err != nil {
+		return directoryEnvelope{}, nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return directoryEnvelope{}, nil, err
+	}
+	aad, err := directoryEnvelopeAAD(envelope, epoch)
+	if err != nil {
+		return directoryEnvelope{}, nil, err
+	}
+	plaintext, err := aead.Open(nil, directoryNonce(envelope.Sequence), ciphertext, aad)
+	if err != nil {
+		return directoryEnvelope{}, nil, fmt.Errorf("authentication failed")
+	}
+	return envelope, plaintext, nil
+}
+
+func (p *directoryPublisher) acceptRequestSequence(envelope directoryEnvelope, now int64) bool {
+	key := envelope.KeyID + ":" + envelope.Epoch
+	p.replayMu.Lock()
+	defer p.replayMu.Unlock()
+	for replayKey, state := range p.replay {
+		if state.ExpiresAt <= now {
+			delete(p.replay, replayKey)
+		}
+	}
+	if previous, ok := p.replay[key]; ok && envelope.Sequence <= previous.Sequence {
+		return false
+	}
+	if len(p.replay) >= 64 {
+		oldestKey := ""
+		var oldestExpiry int64
+		for replayKey, state := range p.replay {
+			if oldestKey == "" || state.ExpiresAt < oldestExpiry {
+				oldestKey = replayKey
+				oldestExpiry = state.ExpiresAt
+			}
+		}
+		delete(p.replay, oldestKey)
+	}
+	p.replay[key] = directoryReplayState{Sequence: envelope.Sequence, ExpiresAt: envelope.ExpiresAt}
+	return true
+}
+
+func (p *directoryPublisher) sourceAllowed(source *net.UDPAddr) bool {
+	if len(p.allowed) == 0 || source == nil {
+		return source != nil
+	}
+	for _, cidr := range p.allowed {
+		if cidr.Contains(source.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseDirectoryAllowCIDRs(raw string) ([]*net.IPNet, error) {
+	parts := strings.Split(strings.TrimSpace(raw), ",")
+	allowed := make([]*net.IPNet, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		_, cidr, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid directory allowed CIDR %q: %w", part, err)
+		}
+		allowed = append(allowed, cidr)
+	}
+	return allowed, nil
+}
+
+func decodeDirectoryJSON(payload []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("trailing JSON data")
+	}
+	return nil
+}
+
+func isDirectoryEnvelopeType(value string) bool {
+	switch value {
+	case directoryEnvelopeSnapshot, directoryEnvelopeParticipants, directoryEnvelopeRequest:
+		return true
+	default:
+		return false
+	}
+}
+
 func loadDirectoryDocument(channelsCSV, speakersCSV string, now time.Time, ttl time.Duration) (directoryDocument, error) {
 	channels, err := loadDirectoryChannels(channelsCSV)
 	if err != nil {
@@ -251,22 +515,48 @@ func loadDirectoryDocument(channelsCSV, speakersCSV string, now time.Time, ttl t
 	if err != nil {
 		return directoryDocument{}, err
 	}
-	revisionPayload, err := json.Marshal(struct {
-		Channels []directoryChannel `json:"channels"`
-		Speakers []directorySpeaker `json:"speakers"`
-	}{Channels: channels, Speakers: speakers})
-	if err != nil {
-		return directoryDocument{}, err
-	}
-	revision := sha256.Sum256(revisionPayload)
-	return directoryDocument{
+	document := directoryDocument{
 		Version:   directoryProtocolVersion,
-		Revision:  hex.EncodeToString(revision[:]),
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(ttl).Unix(),
 		Channels:  channels,
 		Speakers:  speakers,
-	}, nil
+	}
+	document.Revision = directoryDocumentRevision(document)
+	return document, nil
+}
+
+func directoryDocumentRevision(document directoryDocument) string {
+	channels := append([]directoryChannel(nil), document.Channels...)
+	speakers := append([]directorySpeaker(nil), document.Speakers...)
+	sort.Slice(channels, func(i, j int) bool { return channels[i].ChannelID < channels[j].ChannelID })
+	sort.Slice(speakers, func(i, j int) bool {
+		if speakers[i].ChannelID != speakers[j].ChannelID {
+			return speakers[i].ChannelID < speakers[j].ChannelID
+		}
+		return speakers[i].SenderID < speakers[j].SenderID
+	})
+	payload, _ := json.Marshal(struct {
+		Channels []directoryChannel `json:"channels"`
+		Speakers []directorySpeaker `json:"speakers"`
+	}{channels, speakers})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+func directoryParticipantsDocumentRevision(document directoryParticipantsDocument) string {
+	participants := append([]directoryParticipant(nil), document.Participants...)
+	sort.Slice(participants, func(i, j int) bool {
+		if participants[i].ChannelID != participants[j].ChannelID {
+			return participants[i].ChannelID < participants[j].ChannelID
+		}
+		return participants[i].SenderID < participants[j].SenderID
+	})
+	payload, _ := json.Marshal(struct {
+		Participants []directoryParticipant `json:"participants"`
+	}{participants})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }
 
 func loadDirectoryChannels(path string) ([]directoryChannel, error) {

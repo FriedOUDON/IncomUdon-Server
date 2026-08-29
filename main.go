@@ -121,6 +121,52 @@ func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool,
 	}
 }
 
+// directoryParticipants returns the relay's current peer view without exposing
+// endpoint addresses. The directory publisher owns serialization and encrypts
+// this data before it leaves the relay process.
+func (s *server) directoryParticipants() []directoryParticipant {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	byIdentity := make(map[[2]uint32]directoryParticipant)
+	for channelID, ch := range s.channels {
+		for _, peer := range ch.peers {
+			if peer == nil || peer.senderId == 0 || peer.lastSeen.Before(now.Add(-directoryMaxValidity)) {
+				continue
+			}
+			key := [2]uint32{channelID, peer.senderId}
+			candidate := directoryParticipant{
+				ChannelID:  channelID,
+				SenderID:   peer.senderId,
+				LastSeenAt: peer.lastSeen.Unix(),
+				Talking:    false,
+			}
+			if _, active := ch.activeTalkers[peer.senderId]; active {
+				candidate.Talking = true
+			}
+			if previous, exists := byIdentity[key]; !exists || candidate.LastSeenAt > previous.LastSeenAt {
+				byIdentity[key] = candidate
+			}
+		}
+	}
+
+	participants := make([]directoryParticipant, 0, len(byIdentity))
+	for _, participant := range byIdentity {
+		participants = append(participants, participant)
+	}
+	sort.Slice(participants, func(i, j int) bool {
+		if participants[i].ChannelID != participants[j].ChannelID {
+			return participants[i].ChannelID < participants[j].ChannelID
+		}
+		return participants[i].SenderID < participants[j].SenderID
+	})
+	return participants
+}
+
 func (s *server) run() {
 	buf := make([]byte, 2048)
 	for {
@@ -884,11 +930,26 @@ func main() {
 	}
 	multiTalk := flag.Bool("multi-talk", multiTalkDefault, "allow multiple simultaneous talkers")
 	maxActiveTalkers := flag.Int("max-active-talkers", maxActiveTalkersDefault, "maximum simultaneous active talkers when multi-talk is enabled")
+	directoryEnabledDefault := false
+	if raw := os.Getenv("INCOMUDON_DIRECTORY_ENABLED"); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			directoryEnabledDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_DIRECTORY_ENABLED=%q (using false)", raw)
+		}
+	}
+	directoryEnabled := flag.Bool("directory-enabled", directoryEnabledDefault, "enable PSK-protected directory publishing and pull requests")
 	directoryChannelsCSV := flag.String("directory-channels-csv", os.Getenv("INCOMUDON_DIRECTORY_CHANNELS_CSV"), "CSV file containing channel_id,name for PSK directory publishing")
 	directorySpeakersCSV := flag.String("directory-speakers-csv", os.Getenv("INCOMUDON_DIRECTORY_SPEAKERS_CSV"), "CSV file containing channel_id,sender_id,name for PSK directory publishing")
 	directoryUDPTarget := flag.String("directory-udp-target", os.Getenv("INCOMUDON_DIRECTORY_UDP_TARGET"), "PWA UDP target for PSK directory snapshots")
+	directoryUDPListenDefault := os.Getenv("INCOMUDON_DIRECTORY_UDP_LISTEN")
+	if directoryUDPListenDefault == "" {
+		directoryUDPListenDefault = ":51000"
+	}
+	directoryUDPListen := flag.String("directory-udp-listen", directoryUDPListenDefault, "UDP listen address for authenticated directory pull requests")
 	directoryPSKFile := flag.String("directory-psk-file", os.Getenv("INCOMUDON_DIRECTORY_PSK_FILE"), "path to base64url directory PSK file")
 	directoryKeyID := flag.String("directory-key-id", os.Getenv("INCOMUDON_DIRECTORY_KEY_ID"), "directory PSK recipient key ID (default pwa-1)")
+	directoryRequestAllowCIDRs := flag.String("directory-request-allow-cidrs", os.Getenv("INCOMUDON_DIRECTORY_REQUEST_ALLOW_CIDRS"), "optional comma-separated source CIDRs allowed to request directory snapshots")
 	directoryPublishInterval := flag.Duration("directory-publish-interval", directoryDurationFromEnv("INCOMUDON_DIRECTORY_PUBLISH_INTERVAL", directoryDefaultInterval), "directory snapshot publish interval")
 	directoryTTL := flag.Duration("directory-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_TTL", directoryDefaultTTL), "directory snapshot validity")
 	noCrypto := flag.Bool("no-crypto", false, "accept/send packets without security header/tag")
@@ -910,22 +971,30 @@ func main() {
 		log.Fatalf("listen error: %v", err)
 	}
 	defer conn.Close()
+	srv := newServer(conn, *noCrypto, *logPackets, *logAudio, talkMax, *multiTalk, *maxActiveTalkers)
 
 	directoryPublisher, err := newDirectoryPublisher(directoryPublisherConfig{
-		ChannelsCSV: *directoryChannelsCSV,
-		SpeakersCSV: *directorySpeakersCSV,
-		Target:      *directoryUDPTarget,
-		PSKFile:     *directoryPSKFile,
-		KeyID:       *directoryKeyID,
-		Interval:    *directoryPublishInterval,
-		TTL:         *directoryTTL,
+		Enabled:           *directoryEnabled,
+		ChannelsCSV:       *directoryChannelsCSV,
+		SpeakersCSV:       *directorySpeakersCSV,
+		Target:            *directoryUDPTarget,
+		ListenAddress:     *directoryUDPListen,
+		PSKFile:           *directoryPSKFile,
+		KeyID:             *directoryKeyID,
+		Interval:          *directoryPublishInterval,
+		TTL:               *directoryTTL,
+		RequestAllowCIDRs: *directoryRequestAllowCIDRs,
+		Participants:      srv.directoryParticipants,
 	})
 	if err != nil {
 		log.Fatalf("invalid directory publishing configuration: %v", err)
 	}
 	if directoryPublisher != nil {
 		defer directoryPublisher.Close()
-		log.Printf("PSK directory publishing enabled: target=%s interval=%s ttl=%s", *directoryUDPTarget, *directoryPublishInterval, *directoryTTL)
+		log.Printf("PSK directory enabled: target=%s listen=%s interval=%s ttl=%s", *directoryUDPTarget, *directoryUDPListen, *directoryPublishInterval, *directoryTTL)
+		if len(directoryPublisher.allowed) == 0 {
+			log.Printf("PSK directory request source CIDR filtering is disabled; configure -directory-request-allow-cidrs to reduce unauthenticated UDP load")
+		}
 		go directoryPublisher.Run()
 	}
 
@@ -938,7 +1007,6 @@ func main() {
 	if *logAudio {
 		*logPackets = true
 	}
-	srv := newServer(conn, *noCrypto, *logPackets, *logAudio, talkMax, *multiTalk, *maxActiveTalkers)
 	go srv.cleanupLoop(*timeout)
 	srv.run()
 }
