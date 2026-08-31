@@ -171,3 +171,51 @@ func TestForwardsAESGCMV2MediaPacketWithoutChangingAuthenticatedHeader(t *testin
 		t.Fatal("Relay modified v2 media packet bytes")
 	}
 }
+
+func TestPingRepliesOnlyToRegisteredEndpoint(t *testing.T) {
+	relay := newTestUDPConn(t)
+	requester := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	unknown := newTestUDPConn(t)
+	const channelID uint32 = 45
+	const requesterID uint32 = 5001
+	nonce := []byte{0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80}
+
+	s := newServer(relay, true, false, false, 0, true, 2)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(requester.LocalAddr().(*net.UDPAddr)): {addr: requester.LocalAddr().(*net.UDPAddr), senderId: requesterID},
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)):  {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 5002},
+		},
+		activeTalkers: make(map[uint32]time.Time),
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	payload := append([]byte(nil), nonce...)
+	raw := buildControlPacket(pktPing, channelID, requesterID, payload, true)
+	pkt, ok := parsePacket(raw, true)
+	if !ok {
+		t.Fatal("failed to parse ping test packet")
+	}
+	s.handlePacket(pkt, requester.LocalAddr().(*net.UDPAddr))
+
+	pong := receiveTestPacket(t, requester)
+	if pong.Header.Type != pktPong {
+		t.Fatalf("expected pong, got type=%d", pong.Header.Type)
+	}
+	if pong.Header.ChannelId != channelID || pong.Header.SenderId != requesterID {
+		t.Fatalf("unexpected pong header: channel=%d sender=%d", pong.Header.ChannelId, pong.Header.SenderId)
+	}
+	if string(pong.Payload) != string(nonce) {
+		t.Fatalf("pong nonce mismatch: got=%x want=%x", pong.Payload, nonce)
+	}
+	expectNoTestPacket(t, listener)
+
+	unknownRaw := buildControlPacket(pktPing, channelID, 5999, nonce, true)
+	unknownPkt, ok := parsePacket(unknownRaw, true)
+	if !ok {
+		t.Fatal("failed to parse unknown ping test packet")
+	}
+	s.handlePacket(unknownPkt, unknown.LocalAddr().(*net.UDPAddr))
+	expectNoTestPacket(t, unknown)
+}

@@ -35,6 +35,8 @@ const (
 	pktCodecConfig = 0x0B
 	pktFec         = 0x0C
 	pktServerCfg   = 0x0D
+	pktPing        = 0x0E
+	pktPong        = 0x0F
 )
 
 const (
@@ -199,6 +201,18 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		return
 	}
 
+	// PING is an endpoint-liveness probe, not a channel message.  Only reply
+	// to an address that has already joined this channel with the same sender
+	// ID.  Requiring the fixed-size nonce also prevents the relay from being
+	// used as a UDP reflector/amplifier.
+	if pkt.Header.Type == pktPing {
+		if len(pkt.Payload) != 8 || !s.touchKnownPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+			return
+		}
+		s.sendPong(addr, pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload)
+		return
+	}
+
 	if releasedTalkerIDs := s.expireTalkIfNeeded(pkt.Header.ChannelId); len(releasedTalkerIDs) > 0 {
 		for _, releasedTalkerID := range releasedTalkerIDs {
 			log.Printf("talk_timeout ch=%d talker=%d max=%s",
@@ -311,6 +325,56 @@ func (s *server) upsertPeer(ch *channel, senderId uint32, addr *net.UDPAddr) {
 	p.senderId = senderId
 	p.addr = addr
 	p.lastSeen = time.Now()
+}
+
+// touchKnownPeer refreshes a peer only when both its sender ID and source UDP
+// endpoint match a prior JOIN-derived registration.  Unlike normal packets,
+// a PING must never create or rebind a peer entry.
+func (s *server) touchKnownPeer(channelId uint32, senderId uint32, addr *net.UDPAddr) bool {
+	if senderId == 0 || addr == nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ch := s.channels[channelId]
+	if ch == nil {
+		return false
+	}
+
+	peerKey := peerMapKey(addr)
+	p := ch.peers[peerKey]
+	if p == nil {
+		// The primary key is the address string.  The fallback keeps this check
+		// robust for in-process users and tests that construct peer maps directly.
+		for _, candidate := range ch.peers {
+			if candidate == nil || candidate.addr == nil {
+				continue
+			}
+			if candidate.addr.Port == addr.Port && candidate.addr.Zone == addr.Zone && candidate.addr.IP.Equal(addr.IP) {
+				p = candidate
+				break
+			}
+		}
+	}
+	if p == nil || p.senderId != senderId {
+		return false
+	}
+
+	p.lastSeen = time.Now()
+	return true
+}
+
+func (s *server) sendPong(addr *net.UDPAddr, channelId uint32, senderId uint32, nonce []byte) {
+	if addr == nil || len(nonce) != 8 {
+		return
+	}
+
+	packet := buildControlPacket(pktPong, channelId, senderId, nonce, s.noCrypto)
+	if _, err := s.conn.WriteToUDP(packet, addr); err != nil {
+		log.Printf("pong send failed ch=%d sender=%d to=%s: %v", channelId, senderId, addr, err)
+	}
 }
 
 func (s *server) removePeer(channelId uint32, senderId uint32, addr *net.UDPAddr) {
