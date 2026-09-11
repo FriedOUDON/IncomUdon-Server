@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -54,12 +55,13 @@ func TestDuplicatePttOnOnlyRegrantsRequester(t *testing.T) {
 	const requesterID uint32 = 1001
 
 	s := newServer(relay, true, false, false, 0, true, 2)
+	grantedAt := time.Now().Add(-250 * time.Millisecond)
 	s.channels[channelID] = &channel{
 		peers: map[string]*peer{
 			"requester": {addr: requester.LocalAddr().(*net.UDPAddr), senderId: requesterID},
 			"listener":  {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 1002},
 		},
-		activeTalkers: map[uint32]time.Time{requesterID: time.Now()},
+		activeTalkers: map[uint32]time.Time{requesterID: grantedAt},
 		codecConfigs:  make(map[uint32][]byte),
 	}
 
@@ -68,7 +70,79 @@ func TestDuplicatePttOnOnlyRegrantsRequester(t *testing.T) {
 	if packet.Header.Type != pktTalkGrant {
 		t.Fatalf("expected grant, got type=%d", packet.Header.Type)
 	}
+	if got := s.channels[channelID].activeTalkers[requesterID]; !got.Equal(grantedAt) {
+		t.Fatalf("duplicate PTT_ON reset deadline: got=%s want=%s", got, grantedAt)
+	}
 	expectNoTestPacket(t, listener)
+}
+
+func TestTalkReleaseCarriesClientPttOffReason(t *testing.T) {
+	relay := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 46
+	const talkerID uint32 = 6001
+
+	s := newServer(relay, true, false, false, 0, false, 1)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			"listener": {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 6002},
+		},
+		activeTalkers: map[uint32]time.Time{talkerID: time.Now()},
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	s.handlePttOff(channelID, talkerID)
+	packet := receiveTestPacket(t, listener)
+	if packet.Header.Type != pktTalkRelease {
+		t.Fatalf("expected release, got type=%d", packet.Header.Type)
+	}
+	if len(packet.Payload) != 5 {
+		t.Fatalf("release payload length = %d, want 5", len(packet.Payload))
+	}
+	if got := binary.BigEndian.Uint32(packet.Payload[:4]); got != talkerID {
+		t.Fatalf("release talker ID = %d, want %d", got, talkerID)
+	}
+	if got := packet.Payload[4]; got != talkReleaseClientPttOff {
+		t.Fatalf("release reason = %d, want %d", got, talkReleaseClientPttOff)
+	}
+}
+
+func TestServerConfigUsesEffectiveTalkerLimit(t *testing.T) {
+	relay := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 47
+	const listenerID uint32 = 7001
+
+	s := newServer(relay, true, false, false, 0, false, maxActiveTalkersV1)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			"listener": {addr: listener.LocalAddr().(*net.UDPAddr), senderId: listenerID},
+		},
+		activeTalkers: make(map[uint32]time.Time),
+		codecConfigs:  make(map[uint32][]byte),
+	}
+	s.sendServerConfig(channelID, listenerID)
+	packet := receiveTestPacket(t, listener)
+	if packet.Header.Type != pktServerCfg || len(packet.Payload) != 4 {
+		t.Fatalf("unexpected server config packet: type=%d payload=%v", packet.Header.Type, packet.Payload)
+	}
+	if got := packet.Payload[3]; got != 1 {
+		t.Fatalf("single-talk server config limit = %d, want 1", got)
+	}
+
+	s = newServer(relay, true, false, false, 0, true, maxActiveTalkersV1+10)
+	if s.maxActiveTalkers != maxActiveTalkersV1 {
+		t.Fatalf("max active talkers = %d, want clamp %d", s.maxActiveTalkers, maxActiveTalkersV1)
+	}
+}
+
+func TestUDPDatagramSizeLimit(t *testing.T) {
+	if !acceptsUDPDatagramSize(maxUDPDatagramBytes) {
+		t.Fatalf("%d-byte datagram should be accepted", maxUDPDatagramBytes)
+	}
+	if acceptsUDPDatagramSize(maxUDPDatagramBytes + 1) {
+		t.Fatalf("oversize datagram should be rejected")
+	}
 }
 
 func TestJoinSyncSendsCodecConfigBeforeGrant(t *testing.T) {

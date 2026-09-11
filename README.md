@@ -20,7 +20,10 @@ go run . -port 50000 -log-packets -log-audio
 ```
 
 `-log-packets` includes codec config details (`codec_id`, `mode`, `pcm_only`) when `pktCodecConfig` is received.
-The server also emits UDP packet-size monitor logs (`udp_size_warn`, `udp_fragment_risk`, `udp_size_stats`) to help detect fragmentation risk at high bitrates.
+Version 1 Relay traffic is limited to 1200-byte UDP datagrams. Oversize
+datagrams are discarded before parsing or forwarding; packet logging emits
+`udp_datagram_drop` for those drops and `udp_size_near_limit` for accepted
+media close to the limit.
 
 ## Server-managed TX timeout
 
@@ -40,6 +43,8 @@ Notes:
 - `0` disables timeout.
 - If both are set, `-talk-max-sec` takes precedence.
 - On channel join, server sends this value to clients via `pktServerCfg` so clients can show remaining TX time.
+- `TALK_RELEASE` carries the v1 release reason: client PTT off, server timeout,
+  membership timeout, or client leave.
 
 ## Simultaneous transmit (multi-talk)
 
@@ -60,6 +65,7 @@ go run . -port 50000
 
 Notes:
 - Multi-talk is disabled by default; disabled mode always permits one talker.
+- `INCOMUDON_MAX_ACTIVE_TALKERS` and `-max-active-talkers` accept `1..16`.
 - The relay sends the enabled flag and maximum to each joining client via
   `pktServerCfg`.
 - A late-joining client receives the current talkers' cached codec settings

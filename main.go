@@ -19,6 +19,9 @@ const (
 	securityHeaderSize                 = 12
 	authTagSize                        = 16
 	packetFlagAESGCMV2HeaderAAD uint16 = 1 << 0
+	maxUDPDatagramBytes                = 1200
+	maxActiveTalkersV1                 = 16
+	udpNearLimitBytes                  = 1150
 )
 
 const (
@@ -40,8 +43,10 @@ const (
 )
 
 const (
-	udpWarnPayloadBytes = 1200
-	udpFragPayloadBytes = 1472
+	talkReleaseClientPttOff      = 0x00
+	talkReleaseServerTimeout     = 0x01
+	talkReleaseMembershipTimeout = 0x02
+	talkReleaseClientLeave       = 0x03
 )
 
 type packetHeader struct {
@@ -92,9 +97,7 @@ type server struct {
 	sizeWindowMaxCh     uint32
 	sizeWindowMaxSender uint32
 	sizeWindowOverWarn  int
-	sizeWindowOverFrag  int
 	lastWarnLog         time.Time
-	lastFragLog         time.Time
 	talkMax             time.Duration
 	multiTalk           bool
 	maxActiveTalkers    int
@@ -110,6 +113,9 @@ func peerMapKey(addr *net.UDPAddr) string {
 func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool, talkMax time.Duration, multiTalk bool, maxActiveTalkers int) *server {
 	if maxActiveTalkers < 1 {
 		maxActiveTalkers = 1
+	}
+	if maxActiveTalkers > maxActiveTalkersV1 {
+		maxActiveTalkers = maxActiveTalkersV1
 	}
 	return &server{
 		channels:         make(map[uint32]*channel),
@@ -171,7 +177,9 @@ func (s *server) directoryParticipants() []directoryParticipant {
 }
 
 func (s *server) run() {
-	buf := make([]byte, 2048)
+	// A Version 1 Relay never parses or forwards an over-limit datagram.
+	// Reading one extra byte also detects datagrams truncated by the socket read.
+	buf := make([]byte, maxUDPDatagramBytes+1)
 	for {
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -181,6 +189,12 @@ func (s *server) run() {
 
 		data := make([]byte, n)
 		copy(data, buf[:n])
+		if !acceptsUDPDatagramSize(n) {
+			if s.logPackets {
+				log.Printf("udp_datagram_drop reason=oversize size=%d max=%d from=%s", n, maxUDPDatagramBytes, addr)
+			}
+			continue
+		}
 
 		pkt, ok := parsePacket(data, s.noCrypto)
 		if !ok {
@@ -194,6 +208,10 @@ func (s *server) run() {
 
 		s.handlePacket(pkt, addr)
 	}
+}
+
+func acceptsUDPDatagramSize(size int) bool {
+	return size >= 0 && size <= maxUDPDatagramBytes
 }
 
 func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
@@ -219,7 +237,7 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 				pkt.Header.ChannelId,
 				releasedTalkerID,
 				s.talkMax)
-			s.broadcast(pkt.Header.ChannelId, buildTalkPacket(pktTalkRelease, pkt.Header.ChannelId, releasedTalkerID, s.noCrypto))
+			s.broadcast(pkt.Header.ChannelId, buildTalkReleasePacket(pkt.Header.ChannelId, releasedTalkerID, talkReleaseServerTimeout, s.noCrypto))
 		}
 	}
 
@@ -239,7 +257,7 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		log.Printf("leave ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
 		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
-		s.releaseTalkIfNeeded(pkt.Header.ChannelId, pkt.Header.SenderId)
+		s.releaseTalkIfNeeded(pkt.Header.ChannelId, pkt.Header.SenderId, talkReleaseClientLeave)
 	case pktPttOn:
 		log.Printf("ptt_on ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.handlePttOn(pkt.Header.ChannelId, pkt.Header.SenderId)
@@ -430,7 +448,6 @@ func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 
 	now := time.Now()
 	if _, ok := ch.activeTalkers[senderId]; ok {
-		ch.activeTalkers[senderId] = now
 		s.mu.Unlock()
 		log.Printf("talk_grant ch=%d talker=%d (already granted)", channelId, senderId)
 		// A duplicated PTT_ON should only repair a lost grant for its sender.
@@ -479,10 +496,10 @@ func (s *server) handlePttOff(channelId uint32, senderId uint32) {
 	delete(ch.activeTalkers, senderId)
 	s.mu.Unlock()
 	log.Printf("talk_release ch=%d talker=%d", channelId, senderId)
-	s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, senderId, s.noCrypto))
+	s.broadcast(channelId, buildTalkReleasePacket(channelId, senderId, talkReleaseClientPttOff, s.noCrypto))
 }
 
-func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32) {
+func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32, reason uint8) {
 	s.mu.Lock()
 	ch := s.channels[channelId]
 	if ch == nil {
@@ -497,8 +514,8 @@ func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32) {
 
 	delete(ch.activeTalkers, senderId)
 	s.mu.Unlock()
-	log.Printf("talk_release ch=%d talker=%d (peer_left)", channelId, senderId)
-	s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, senderId, s.noCrypto))
+	log.Printf("talk_release ch=%d talker=%d reason=%d (peer_left)", channelId, senderId, reason)
+	s.broadcast(channelId, buildTalkReleasePacket(channelId, senderId, reason, s.noCrypto))
 }
 
 func (s *server) expireTalkIfNeeded(channelId uint32) []uint32 {
@@ -551,12 +568,15 @@ func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
 	if s.multiTalk {
 		payload[2] |= 0x01
 	}
-	limit := s.maxActiveTalkers
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > 0xFF {
-		limit = 0xFF
+	limit := 1
+	if s.multiTalk {
+		limit = s.maxActiveTalkers
+		if limit < 1 {
+			limit = 1
+		}
+		if limit > maxActiveTalkersV1 {
+			limit = maxActiveTalkersV1
+		}
 	}
 	payload[3] = byte(limit)
 	packet := buildControlPacket(pktServerCfg, channelId, 0, payload, s.noCrypto)
@@ -660,21 +680,37 @@ func (s *server) sendTo(channelId uint32, senderId uint32, data []byte) {
 }
 
 func (s *server) cleanupLoop(timeout time.Duration) {
-	ticker := time.NewTicker(timeout / 2)
+	interval := timeout / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+	// Check monotonic talk deadlines independently of peer expiry.  Waiting for
+	// the normal 15-second peer cleanup interval would forward stale talk media
+	// after a short server-managed PTT lease has expired.
+	if s.talkMax > 0 && interval > 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		now := time.Now()
+		type releaseEvent struct {
+			channelID uint32
+			talkerID  uint32
+			reason    uint8
+		}
+		releases := make([]releaseEvent, 0)
 
 		s.mu.Lock()
 		for channelId, ch := range s.channels {
-			releasedTalkers := make([]uint32, 0)
+			releaseReasons := make(map[uint32]uint8)
 			for key, p := range ch.peers {
 				if now.Sub(p.lastSeen) > timeout {
 					delete(ch.peers, key)
 					if _, ok := ch.activeTalkers[p.senderId]; ok {
 						delete(ch.activeTalkers, p.senderId)
-						releasedTalkers = append(releasedTalkers, p.senderId)
+						releaseReasons[p.senderId] = talkReleaseMembershipTimeout
 					}
 				}
 			}
@@ -688,23 +724,30 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 						continue
 					}
 					delete(ch.activeTalkers, senderID)
-					releasedTalkers = append(releasedTalkers, senderID)
+					if _, releasedForMembership := releaseReasons[senderID]; !releasedForMembership {
+						releaseReasons[senderID] = talkReleaseServerTimeout
+					}
 				}
 			}
 			if len(ch.peers) == 0 {
 				delete(s.channels, channelId)
 			}
-			if len(releasedTalkers) > 0 {
-				sort.Slice(releasedTalkers, func(i, j int) bool { return releasedTalkers[i] < releasedTalkers[j] })
-				s.mu.Unlock()
-				for _, talker := range releasedTalkers {
-					log.Printf("talk_release ch=%d talker=%d (cleanup)", channelId, talker)
-					s.broadcast(channelId, buildTalkPacket(pktTalkRelease, channelId, talker, s.noCrypto))
-				}
-				s.mu.Lock()
+			for talkerID, reason := range releaseReasons {
+				releases = append(releases, releaseEvent{channelID: channelId, talkerID: talkerID, reason: reason})
 			}
 		}
 		s.mu.Unlock()
+
+		sort.Slice(releases, func(i, j int) bool {
+			if releases[i].channelID != releases[j].channelID {
+				return releases[i].channelID < releases[j].channelID
+			}
+			return releases[i].talkerID < releases[j].talkerID
+		})
+		for _, release := range releases {
+			log.Printf("talk_release ch=%d talker=%d reason=%d (cleanup)", release.channelID, release.talkerID, release.reason)
+			s.broadcast(release.channelID, buildTalkReleasePacket(release.channelID, release.talkerID, release.reason, s.noCrypto))
+		}
 	}
 }
 
@@ -784,43 +827,28 @@ func (s *server) observePacketSize(pkt parsedPacket, addr *net.UDPAddr, size int
 	}
 
 	isRealtimeMedia := pkt.Header.Type == pktAudio || pkt.Header.Type == pktFec
-	if isRealtimeMedia && size > udpWarnPayloadBytes {
+	if isRealtimeMedia && size > udpNearLimitBytes {
 		s.sizeWindowOverWarn++
 		if now.Sub(s.lastWarnLog) >= 3*time.Second {
-			log.Printf("udp_size_warn type=%s size=%dB ch=%d sender=%d from=%s threshold=%dB",
+			log.Printf("udp_size_near_limit type=%s size=%dB ch=%d sender=%d from=%s threshold=%dB",
 				pktTypeName(pkt.Header.Type),
 				size,
 				pkt.Header.ChannelId,
 				pkt.Header.SenderId,
 				addr.String(),
-				udpWarnPayloadBytes)
+				udpNearLimitBytes)
 			s.lastWarnLog = now
-		}
-	}
-
-	if isRealtimeMedia && size > udpFragPayloadBytes {
-		s.sizeWindowOverFrag++
-		if now.Sub(s.lastFragLog) >= 3*time.Second {
-			log.Printf("udp_fragment_risk type=%s size=%dB ch=%d sender=%d from=%s threshold=%dB",
-				pktTypeName(pkt.Header.Type),
-				size,
-				pkt.Header.ChannelId,
-				pkt.Header.SenderId,
-				addr.String(),
-				udpFragPayloadBytes)
-			s.lastFragLog = now
 		}
 	}
 
 	if now.Sub(s.sizeWindowStart) >= 30*time.Second {
 		if s.sizeWindowMax > 0 {
-			log.Printf("udp_size_stats window=30s max=%dB max_type=%s max_ch=%d max_sender=%d over_%dB=%d over_%dB=%d",
+			log.Printf("udp_size_stats window=30s max=%dB max_type=%s max_ch=%d max_sender=%d near_%dB=%d",
 				s.sizeWindowMax,
 				pktTypeName(s.sizeWindowMaxType),
 				s.sizeWindowMaxCh,
 				s.sizeWindowMaxSender,
-				udpWarnPayloadBytes, s.sizeWindowOverWarn,
-				udpFragPayloadBytes, s.sizeWindowOverFrag)
+				udpNearLimitBytes, s.sizeWindowOverWarn)
 		}
 		s.sizeWindowStart = now
 		s.sizeWindowMax = 0
@@ -828,7 +856,6 @@ func (s *server) observePacketSize(pkt parsedPacket, addr *net.UDPAddr, size int
 		s.sizeWindowMaxCh = 0
 		s.sizeWindowMaxSender = 0
 		s.sizeWindowOverWarn = 0
-		s.sizeWindowOverFrag = 0
 	}
 }
 
@@ -965,6 +992,13 @@ func buildTalkPacket(pktType uint8, channelId uint32, talkerId uint32, noCrypto 
 	return buildControlPacket(pktType, channelId, talkerId, payload, noCrypto)
 }
 
+func buildTalkReleasePacket(channelId uint32, talkerId uint32, reason uint8, noCrypto bool) []byte {
+	payload := make([]byte, 5)
+	binary.BigEndian.PutUint32(payload, talkerId)
+	payload[4] = reason
+	return buildControlPacket(pktTalkRelease, channelId, talkerId, payload, noCrypto)
+}
+
 func main() {
 	port := flag.Int("port", 50000, "UDP listen port")
 	timeout := flag.Duration("timeout", 30*time.Second, "peer timeout")
@@ -987,10 +1021,10 @@ func main() {
 	}
 	maxActiveTalkersDefault := 2
 	if raw := os.Getenv("INCOMUDON_MAX_ACTIVE_TALKERS"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 1 && parsed <= maxActiveTalkersV1 {
 			maxActiveTalkersDefault = parsed
 		} else {
-			log.Printf("invalid INCOMUDON_MAX_ACTIVE_TALKERS=%q (using 2)", raw)
+			log.Printf("invalid INCOMUDON_MAX_ACTIVE_TALKERS=%q (using 2; allowed range is 1..%d)", raw, maxActiveTalkersV1)
 		}
 	}
 	multiTalk := flag.Bool("multi-talk", multiTalkDefault, "allow multiple simultaneous talkers")
@@ -1003,7 +1037,7 @@ func main() {
 			log.Printf("invalid INCOMUDON_DIRECTORY_ENABLED=%q (using false)", raw)
 		}
 	}
-	directoryEnabled := flag.Bool("directory-enabled", directoryEnabledDefault, "enable PSK-protected directory publishing and pull requests")
+	directoryEnabled := flag.Bool("directory-enabled", directoryEnabledDefault, "enable Directory publishing and pull requests")
 	directoryDynamicClientsDefault := false
 	if raw := os.Getenv("INCOMUDON_DIRECTORY_DYNAMIC_CLIENTS_ENABLED"); raw != "" {
 		if parsed, err := strconv.ParseBool(raw); err == nil {
@@ -1013,8 +1047,8 @@ func main() {
 		}
 	}
 	directoryDynamicClients := flag.Bool("directory-dynamic-clients", directoryDynamicClientsDefault, "accept authenticated PWA/native directory client registrations")
-	directoryChannelsCSV := flag.String("directory-channels-csv", os.Getenv("INCOMUDON_DIRECTORY_CHANNELS_CSV"), "CSV file containing channel_id,name for PSK directory publishing")
-	directorySpeakersCSV := flag.String("directory-speakers-csv", os.Getenv("INCOMUDON_DIRECTORY_SPEAKERS_CSV"), "CSV file containing channel_id,sender_id,name for PSK directory publishing")
+	directoryChannelsCSV := flag.String("directory-channels-csv", os.Getenv("INCOMUDON_DIRECTORY_CHANNELS_CSV"), "CSV file containing channel_id,name for Directory publishing")
+	directorySpeakersCSV := flag.String("directory-speakers-csv", os.Getenv("INCOMUDON_DIRECTORY_SPEAKERS_CSV"), "CSV file containing channel_id,sender_id,name for Directory publishing")
 	directoryUDPTarget := flag.String("directory-udp-target", os.Getenv("INCOMUDON_DIRECTORY_UDP_TARGET"), "PWA UDP target for PSK directory snapshots")
 	directoryUDPListenDefault := os.Getenv("INCOMUDON_DIRECTORY_UDP_LISTEN")
 	if directoryUDPListenDefault == "" {
@@ -1038,6 +1072,10 @@ func main() {
 	}
 	if *maxActiveTalkers < 1 {
 		*maxActiveTalkers = 1
+	}
+	if *maxActiveTalkers > maxActiveTalkersV1 {
+		log.Printf("max-active-talkers=%d exceeds Version 1 limit; clamping to %d", *maxActiveTalkers, maxActiveTalkersV1)
+		*maxActiveTalkers = maxActiveTalkersV1
 	}
 	talkMax := time.Duration(*talkMaxSec) * time.Second
 
