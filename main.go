@@ -16,30 +16,35 @@ import (
 const (
 	protocolVersion                    = 1
 	fixedHeaderSize                    = 16
-	securityHeaderSize                 = 12
+	legacySecurityHeaderSize           = 12
+	aesGCMV2MediaHeaderSize            = 20
+	aesGCMV2HeaderSize                 = fixedHeaderSize + aesGCMV2MediaHeaderSize
 	authTagSize                        = 16
 	packetFlagAESGCMV2HeaderAAD uint16 = 1 << 0
+	packetFlagControlAuthV1     uint16 = 1 << 1
 	maxUDPDatagramBytes                = 1200
 	maxActiveTalkersV1                 = 16
 	udpNearLimitBytes                  = 1150
 )
 
 const (
-	pktAudio       = 0x01
-	pktPttOn       = 0x02
-	pktPttOff      = 0x03
-	pktKeepalive   = 0x04
-	pktJoin        = 0x05
-	pktLeave       = 0x06
-	pktTalkGrant   = 0x07
-	pktTalkRelease = 0x08
-	pktTalkDeny    = 0x09
-	pktKeyExchange = 0x0A
-	pktCodecConfig = 0x0B
-	pktFec         = 0x0C
-	pktServerCfg   = 0x0D
-	pktPing        = 0x0E
-	pktPong        = 0x0F
+	pktAudio         = 0x01
+	pktPttOn         = 0x02
+	pktPttOff        = 0x03
+	pktKeepalive     = 0x04
+	pktJoin          = 0x05
+	pktLeave         = 0x06
+	pktTalkGrant     = 0x07
+	pktTalkRelease   = 0x08
+	pktTalkDeny      = 0x09
+	pktKeyExchange   = 0x0A
+	pktCodecConfig   = 0x0B
+	pktFec           = 0x0C
+	pktServerCfg     = 0x0D
+	pktPing          = 0x0E
+	pktPong          = 0x0F
+	pktAuthHello     = 0x10
+	pktAuthChallenge = 0x11
 )
 
 const (
@@ -60,8 +65,10 @@ type packetHeader struct {
 }
 
 type securityHeader struct {
-	Nonce uint64
-	KeyId uint32
+	ControlNonce   uint64
+	MediaNonceBase [12]byte
+	MediaCounter   uint32
+	KeyID          uint32
 }
 
 type parsedPacket struct {
@@ -73,15 +80,27 @@ type parsedPacket struct {
 }
 
 type peer struct {
-	senderId uint32
-	addr     *net.UDPAddr
-	lastSeen time.Time
+	senderId          uint32
+	addr              *net.UDPAddr
+	lastSeen          time.Time
+	authenticated     bool
+	controlSessionID  uint32
+	controlKeyID      uint32
+	controlHighest    uint32
+	controlSeenWindow uint64
+}
+
+type codecConfigState struct {
+	payload        []byte
+	mediaNonceBase [12]byte
+	mediaKeyID     uint32
 }
 
 type channel struct {
-	peers         map[string]*peer
-	activeTalkers map[uint32]time.Time
-	codecConfigs  map[uint32][]byte
+	peers             map[string]*peer
+	activeTalkers     map[uint32]time.Time
+	codecConfigs      map[uint32][]byte
+	mediaCodecConfigs map[uint32]codecConfigState
 }
 
 type server struct {
@@ -101,6 +120,7 @@ type server struct {
 	talkMax             time.Duration
 	multiTalk           bool
 	maxActiveTalkers    int
+	controlAuth         *controlAuthState
 }
 
 func peerMapKey(addr *net.UDPAddr) string {
@@ -128,6 +148,10 @@ func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool,
 		multiTalk:        multiTalk,
 		maxActiveTalkers: maxActiveTalkers,
 	}
+}
+
+func (s *server) configureControlAuth(state *controlAuthState) {
+	s.controlAuth = state
 }
 
 // directoryParticipants returns the relay's current peer view without exposing
@@ -218,17 +242,60 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 	if pkt.Header.Version != protocolVersion {
 		return
 	}
+	if pkt.Header.Type == pktAudio || pkt.Header.Type == pktFec {
+		s.handleMediaPacket(pkt, addr)
+		return
+	}
 
-	// PING is an endpoint-liveness probe, not a channel message.  Only reply
-	// to an address that has already joined this channel with the same sender
-	// ID.  Requiring the fixed-size nonce also prevents the relay from being
-	// used as a UDP reflector/amplifier.
+	requiresAuth := s.controlAuthRequired(pkt.Header.ChannelId)
+	if pkt.Header.Type == pktAuthHello {
+		if !requiresAuth {
+			return
+		}
+		meta, ok := s.verifyIncomingControl(pkt)
+		if !ok || len(pkt.Payload) != 0 {
+			return
+		}
+		challenge, err := s.controlAuth.createChallenge(pkt, addr, meta)
+		if err != nil {
+			return
+		}
+		s.sendAuthenticatedChallenge(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, challenge)
+		return
+	}
+	// PING is an endpoint-liveness probe, not a channel message. It must not
+	// create or rebind a peer entry, including on compatibility channels.
 	if pkt.Header.Type == pktPing {
+		if requiresAuth {
+			meta, ok := s.verifyIncomingControl(pkt)
+			if !ok || !s.acceptAuthenticatedPeerControl(pkt, addr, meta) {
+				return
+			}
+		}
 		if len(pkt.Payload) != 8 || !s.touchKnownPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
 			return
 		}
 		s.sendPong(addr, pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload)
 		return
+	}
+
+	if pkt.Header.Type == pktJoin && requiresAuth {
+		meta, ok := s.verifyIncomingControl(pkt)
+		if !ok || !s.controlAuth.consumeJoinChallenge(pkt, addr, meta) {
+			return
+		}
+		s.upsertAuthenticatedPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr, meta)
+	} else if requiresAuth {
+		meta, ok := s.verifyIncomingControl(pkt)
+		if !ok || !s.acceptAuthenticatedPeerControl(pkt, addr, meta) {
+			return
+		}
+	} else {
+		// Compatibility channels retain the historic endpoint refresh behavior.
+		s.mu.Lock()
+		ch := s.getOrCreateChannel(pkt.Header.ChannelId)
+		s.upsertPeer(ch, pkt.Header.SenderId, addr)
+		s.mu.Unlock()
 	}
 
 	if releasedTalkerIDs := s.expireTalkIfNeeded(pkt.Header.ChannelId); len(releasedTalkerIDs) > 0 {
@@ -237,26 +304,18 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 				pkt.Header.ChannelId,
 				releasedTalkerID,
 				s.talkMax)
-			s.broadcast(pkt.Header.ChannelId, buildTalkReleasePacket(pkt.Header.ChannelId, releasedTalkerID, talkReleaseServerTimeout, s.noCrypto))
+			s.broadcastRelayControl(pkt.Header.ChannelId, pktTalkRelease, releasedTalkerID, talkReleasePayload(releasedTalkerID, talkReleaseServerTimeout))
 		}
 	}
-
-	s.mu.Lock()
-	ch := s.getOrCreateChannel(pkt.Header.ChannelId)
-	s.upsertPeer(ch, pkt.Header.SenderId, addr)
-	s.mu.Unlock()
 
 	switch pkt.Header.Type {
 	case pktJoin:
 		log.Printf("join ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
-		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
-		s.sendTo(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Raw)
 		s.sendServerConfig(pkt.Header.ChannelId, pkt.Header.SenderId)
 		s.sendCurrentTalkState(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktLeave:
 		log.Printf("leave ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
-		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
 		s.releaseTalkIfNeeded(pkt.Header.ChannelId, pkt.Header.SenderId, talkReleaseClientLeave)
 	case pktPttOn:
 		log.Printf("ptt_on ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
@@ -265,25 +324,47 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		log.Printf("ptt_off ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.handlePttOff(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktCodecConfig:
-		s.cacheCodecConfig(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload)
-		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
-	case pktAudio, pktFec:
-		// FEC belongs to the same authorized media stream as audio.
-		if s.isTalker(pkt.Header.ChannelId, pkt.Header.SenderId) {
-			s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
+		if requiresAuth && len(pkt.Payload) != 17 {
+			return
 		}
+		if !s.cacheCodecConfig(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload) {
+			return
+		}
+		s.broadcastRelayControl(pkt.Header.ChannelId, pktCodecConfig, pkt.Header.SenderId, pkt.Payload)
 	default:
-		s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
+		// Client-originated control packets are consumed by the Relay. Relay
+		// decisions are emitted through authenticated relay control packets.
 	}
+}
+
+func (s *server) handleMediaPacket(pkt parsedPacket, addr *net.UDPAddr) {
+	if !s.isTalker(pkt.Header.ChannelId, pkt.Header.SenderId) {
+		return
+	}
+	if pkt.Header.Flags&packetFlagAESGCMV2HeaderAAD != 0 &&
+		s.controlAuth != nil && !s.controlAuthRequired(pkt.Header.ChannelId) {
+		// AES-GCM v2 always requires Control Authentication v1. Optional and
+		// off policy modes may still serve legacy compatibility channels.
+		return
+	}
+	if s.controlAuthRequired(pkt.Header.ChannelId) {
+		if !s.isAuthenticatedPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr) || !s.mediaMatchesCodecConfig(pkt) {
+			return
+		}
+	}
+	// The Relay intentionally forwards authenticated media byte-for-byte. The
+	// receiver owns final AEAD authentication and replay-window enforcement.
+	s.broadcastExceptAddr(pkt.Header.ChannelId, addr, pkt.Raw)
 }
 
 func (s *server) getOrCreateChannel(channelId uint32) *channel {
 	ch, ok := s.channels[channelId]
 	if !ok {
 		ch = &channel{
-			peers:         make(map[string]*peer),
-			activeTalkers: make(map[uint32]time.Time),
-			codecConfigs:  make(map[uint32][]byte),
+			peers:             make(map[string]*peer),
+			activeTalkers:     make(map[uint32]time.Time),
+			codecConfigs:      make(map[uint32][]byte),
+			mediaCodecConfigs: make(map[uint32]codecConfigState),
 		}
 		s.channels[channelId] = ch
 	}
@@ -311,9 +392,20 @@ func firstActiveTalker(ch *channel) uint32 {
 	return talkers[0]
 }
 
-func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []byte) {
+func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []byte) bool {
 	if len(payload) < 3 {
-		return
+		return false
+	}
+	if s.controlAuthRequired(channelId) {
+		if len(payload) != 17 {
+			return false
+		}
+		var zeroBase [12]byte
+		var announcedBase [12]byte
+		copy(announcedBase[:], payload[5:17])
+		if announcedBase == zeroBase {
+			return false
+		}
 	}
 
 	s.mu.Lock()
@@ -321,12 +413,21 @@ func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []b
 
 	ch := s.channels[channelId]
 	if ch == nil {
-		return
+		return false
 	}
 	if ch.codecConfigs == nil {
 		ch.codecConfigs = make(map[uint32][]byte)
 	}
 	ch.codecConfigs[senderId] = append(ch.codecConfigs[senderId][:0], payload...)
+	if len(payload) == 17 {
+		if ch.mediaCodecConfigs == nil {
+			ch.mediaCodecConfigs = make(map[uint32]codecConfigState)
+		}
+		state := codecConfigState{payload: append([]byte(nil), payload...), mediaKeyID: 2}
+		copy(state.mediaNonceBase[:], payload[5:17])
+		ch.mediaCodecConfigs[senderId] = state
+	}
+	return true
 }
 
 func (s *server) upsertPeer(ch *channel, senderId uint32, addr *net.UDPAddr) {
@@ -388,10 +489,20 @@ func (s *server) sendPong(addr *net.UDPAddr, channelId uint32, senderId uint32, 
 	if addr == nil || len(nonce) != 8 {
 		return
 	}
+	if !s.controlAuthRequired(channelId) {
+		_, _ = s.conn.WriteToUDP(buildControlPacket(pktPong, channelId, senderId, nonce, s.noCrypto), addr)
+		return
+	}
 
-	packet := buildControlPacket(pktPong, channelId, senderId, nonce, s.noCrypto)
-	if _, err := s.conn.WriteToUDP(packet, addr); err != nil {
-		log.Printf("pong send failed ch=%d sender=%d to=%s: %v", channelId, senderId, addr, err)
+	s.mu.Lock()
+	ch := s.channels[channelId]
+	var target *peer
+	if ch != nil {
+		target = ch.peers[peerMapKey(addr)]
+	}
+	s.mu.Unlock()
+	if packet := s.relayControlForPeer(channelId, target, pktPong, senderId, nonce); len(packet) > 0 {
+		_, _ = s.conn.WriteToUDP(packet, addr)
 	}
 }
 
@@ -452,7 +563,7 @@ func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 		log.Printf("talk_grant ch=%d talker=%d (already granted)", channelId, senderId)
 		// A duplicated PTT_ON should only repair a lost grant for its sender.
 		// Broadcasting it resets remote receivers' per-talker playout state.
-		s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, senderId, s.noCrypto))
+		s.sendRelayControlTo(channelId, senderId, pktTalkGrant, senderId, talkPayload(senderId))
 		return
 	}
 
@@ -469,7 +580,7 @@ func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 		activeCount := len(ch.activeTalkers)
 		s.mu.Unlock()
 		log.Printf("talk_grant ch=%d talker=%d active=%d/%d multi=%t", channelId, senderId, activeCount, limit, s.multiTalk)
-		s.broadcast(channelId, buildTalkPacket(pktTalkGrant, channelId, senderId, s.noCrypto))
+		s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
 		return
 	}
 
@@ -477,7 +588,7 @@ func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 	activeCount := len(ch.activeTalkers)
 	s.mu.Unlock()
 	log.Printf("talk_deny ch=%d requester=%d current=%d active=%d/%d multi=%t", channelId, senderId, current, activeCount, limit, s.multiTalk)
-	s.sendTo(channelId, senderId, buildTalkPacket(pktTalkDeny, channelId, current, s.noCrypto))
+	s.sendRelayControlTo(channelId, senderId, pktTalkDeny, current, talkPayload(current))
 }
 
 func (s *server) handlePttOff(channelId uint32, senderId uint32) {
@@ -496,7 +607,7 @@ func (s *server) handlePttOff(channelId uint32, senderId uint32) {
 	delete(ch.activeTalkers, senderId)
 	s.mu.Unlock()
 	log.Printf("talk_release ch=%d talker=%d", channelId, senderId)
-	s.broadcast(channelId, buildTalkReleasePacket(channelId, senderId, talkReleaseClientPttOff, s.noCrypto))
+	s.broadcastRelayControl(channelId, pktTalkRelease, senderId, talkReleasePayload(senderId, talkReleaseClientPttOff))
 }
 
 func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32, reason uint8) {
@@ -515,7 +626,7 @@ func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32, reason u
 	delete(ch.activeTalkers, senderId)
 	s.mu.Unlock()
 	log.Printf("talk_release ch=%d talker=%d reason=%d (peer_left)", channelId, senderId, reason)
-	s.broadcast(channelId, buildTalkReleasePacket(channelId, senderId, reason, s.noCrypto))
+	s.broadcastRelayControl(channelId, pktTalkRelease, senderId, talkReleasePayload(senderId, reason))
 }
 
 func (s *server) expireTalkIfNeeded(channelId uint32) []uint32 {
@@ -579,8 +690,7 @@ func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
 		}
 	}
 	payload[3] = byte(limit)
-	packet := buildControlPacket(pktServerCfg, channelId, 0, payload, s.noCrypto)
-	s.sendTo(channelId, senderId, packet)
+	s.sendRelayControlTo(channelId, senderId, pktServerCfg, 0, payload)
 }
 
 type talkerSyncState struct {
@@ -608,11 +718,10 @@ func (s *server) sendCurrentTalkState(channelId uint32, senderId uint32) {
 	for _, state := range states {
 		// Configure the per-talker decoder before announcing that audio may arrive.
 		if len(state.codecConfig) >= 3 {
-			s.sendTo(channelId, senderId,
-				buildControlPacket(pktCodecConfig, channelId, state.talkerID, state.codecConfig, s.noCrypto))
+			s.sendRelayControlTo(channelId, senderId, pktCodecConfig, state.talkerID, state.codecConfig)
 		}
 		log.Printf("join_sync_talker ch=%d to=%d talker=%d codec_config=%t", channelId, senderId, state.talkerID, len(state.codecConfig) >= 3)
-		s.sendTo(channelId, senderId, buildTalkPacket(pktTalkGrant, channelId, state.talkerID, s.noCrypto))
+		s.sendRelayControlTo(channelId, senderId, pktTalkGrant, state.talkerID, talkPayload(state.talkerID))
 	}
 }
 
@@ -746,7 +855,7 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 		})
 		for _, release := range releases {
 			log.Printf("talk_release ch=%d talker=%d reason=%d (cleanup)", release.channelID, release.talkerID, release.reason)
-			s.broadcast(release.channelID, buildTalkReleasePacket(release.channelID, release.talkerID, release.reason, s.noCrypto))
+			s.broadcastRelayControl(release.channelID, pktTalkRelease, release.talkerID, talkReleasePayload(release.talkerID, release.reason))
 		}
 	}
 }
@@ -763,14 +872,15 @@ func (s *server) logPacket(pkt parsedPacket, addr *net.UDPAddr, size int) {
 			extra = fmt.Sprintf(" codec_config_payload_invalid len=%d", len(pkt.Payload))
 		}
 	}
-	log.Printf("rx type=%s ch=%d sender=%d seq=%d hlen=%d key=%d nonce=%d from=%s size=%d%s",
+	log.Printf("rx type=%s ch=%d sender=%d seq=%d hlen=%d key=%d control_nonce=%d media_counter=%d from=%s size=%d%s",
 		pktTypeName(pkt.Header.Type),
 		pkt.Header.ChannelId,
 		pkt.Header.SenderId,
 		pkt.Header.Seq,
 		pkt.Header.HeaderLen,
-		pkt.Sec.KeyId,
-		pkt.Sec.Nonce,
+		pkt.Sec.KeyID,
+		pkt.Sec.ControlNonce,
+		pkt.Sec.MediaCounter,
 		addr.String(),
 		size,
 		extra)
@@ -906,52 +1016,42 @@ func parsePacket(data []byte, noCrypto bool) (parsedPacket, bool) {
 	header.Seq = binary.BigEndian.Uint16(data[12:14])
 	header.Flags = binary.BigEndian.Uint16(data[14:16])
 
-	if len(data) >= fixedHeaderSize+securityHeaderSize+authTagSize &&
-		header.HeaderLen >= fixedHeaderSize+securityHeaderSize {
-		sec := securityHeader{}
-		sec.Nonce = binary.BigEndian.Uint64(data[16:24])
-		sec.KeyId = binary.BigEndian.Uint32(data[24:28])
-
-		payloadOffset := fixedHeaderSize + securityHeaderSize
-		payloadLen := len(data) - payloadOffset - authTagSize
-		if payloadLen < 0 {
+	if (header.Type == pktAudio || header.Type == pktFec) &&
+		header.Flags&packetFlagAESGCMV2HeaderAAD != 0 {
+		if header.HeaderLen != aesGCMV2HeaderSize || len(data) < aesGCMV2HeaderSize+authTagSize {
 			return parsedPacket{}, false
 		}
-
-		payload := make([]byte, payloadLen)
-		copy(payload, data[payloadOffset:payloadOffset+payloadLen])
-
-		tag := make([]byte, authTagSize)
-		copy(tag, data[payloadOffset+payloadLen:])
-
-		return parsedPacket{
-			Header:  header,
-			Sec:     sec,
-			Payload: payload,
-			Tag:     tag,
-			Raw:     data,
-		}, true
+		sec := securityHeader{KeyID: binary.BigEndian.Uint32(data[32:36]), MediaCounter: binary.BigEndian.Uint32(data[28:32])}
+		copy(sec.MediaNonceBase[:], data[16:28])
+		return parsePacketPayload(data, header, sec, aesGCMV2HeaderSize)
 	}
 
-	if !noCrypto {
+	if header.HeaderLen == fixedHeaderSize+legacySecurityHeaderSize {
+		if len(data) < fixedHeaderSize+legacySecurityHeaderSize+authTagSize {
+			return parsedPacket{}, false
+		}
+		sec := securityHeader{
+			ControlNonce: binary.BigEndian.Uint64(data[16:24]),
+			KeyID:        binary.BigEndian.Uint32(data[24:28]),
+		}
+		return parsePacketPayload(data, header, sec, fixedHeaderSize+legacySecurityHeaderSize)
+	}
+
+	if header.HeaderLen != fixedHeaderSize || !noCrypto {
 		return parsedPacket{}, false
 	}
+	payload := append([]byte(nil), data[fixedHeaderSize:]...)
+	return parsedPacket{Header: header, Payload: payload, Raw: data}, true
+}
 
-	payloadOffset := fixedHeaderSize
-	payloadLen := len(data) - payloadOffset
+func parsePacketPayload(data []byte, header packetHeader, sec securityHeader, payloadOffset int) (parsedPacket, bool) {
+	payloadLen := len(data) - payloadOffset - authTagSize
 	if payloadLen < 0 {
 		return parsedPacket{}, false
 	}
-
-	payload := make([]byte, payloadLen)
-	copy(payload, data[payloadOffset:])
-
-	return parsedPacket{
-		Header:  header,
-		Payload: payload,
-		Tag:     nil,
-		Raw:     data,
-	}, true
+	payload := append([]byte(nil), data[payloadOffset:payloadOffset+payloadLen]...)
+	tag := append([]byte(nil), data[payloadOffset+payloadLen:]...)
+	return parsedPacket{Header: header, Sec: sec, Payload: payload, Tag: tag, Raw: data}, true
 }
 
 func buildControlPacket(pktType uint8, channelId uint32, senderId uint32, payload []byte, noCrypto bool) []byte {
@@ -960,7 +1060,7 @@ func buildControlPacket(pktType uint8, channelId uint32, senderId uint32, payloa
 	header[1] = pktType
 	headerLen := fixedHeaderSize
 	if !noCrypto {
-		headerLen = fixedHeaderSize + securityHeaderSize
+		headerLen = fixedHeaderSize + legacySecurityHeaderSize
 	}
 	binary.BigEndian.PutUint16(header[2:4], uint16(headerLen))
 	binary.BigEndian.PutUint32(header[4:8], channelId)
@@ -975,7 +1075,7 @@ func buildControlPacket(pktType uint8, channelId uint32, senderId uint32, payloa
 		return packet
 	}
 
-	sec := make([]byte, securityHeaderSize)
+	sec := make([]byte, legacySecurityHeaderSize)
 	tag := make([]byte, authTagSize)
 
 	packet := make([]byte, 0, len(header)+len(sec)+len(payload)+len(tag))
@@ -987,16 +1087,24 @@ func buildControlPacket(pktType uint8, channelId uint32, senderId uint32, payloa
 }
 
 func buildTalkPacket(pktType uint8, channelId uint32, talkerId uint32, noCrypto bool) []byte {
-	payload := make([]byte, 4)
-	binary.BigEndian.PutUint32(payload, talkerId)
-	return buildControlPacket(pktType, channelId, talkerId, payload, noCrypto)
+	return buildControlPacket(pktType, channelId, talkerId, talkPayload(talkerId), noCrypto)
 }
 
 func buildTalkReleasePacket(channelId uint32, talkerId uint32, reason uint8, noCrypto bool) []byte {
+	return buildControlPacket(pktTalkRelease, channelId, talkerId, talkReleasePayload(talkerId, reason), noCrypto)
+}
+
+func talkPayload(talkerId uint32) []byte {
+	payload := make([]byte, 5)
+	binary.BigEndian.PutUint32(payload, talkerId)
+	return payload[:4]
+}
+
+func talkReleasePayload(talkerId uint32, reason uint8) []byte {
 	payload := make([]byte, 5)
 	binary.BigEndian.PutUint32(payload, talkerId)
 	payload[4] = reason
-	return buildControlPacket(pktTalkRelease, channelId, talkerId, payload, noCrypto)
+	return payload
 }
 
 func main() {
@@ -1062,6 +1170,13 @@ func main() {
 	directoryPublishInterval := flag.Duration("directory-publish-interval", directoryDurationFromEnv("INCOMUDON_DIRECTORY_PUBLISH_INTERVAL", directoryDefaultInterval), "directory snapshot publish interval")
 	directoryTTL := flag.Duration("directory-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_TTL", directoryDefaultTTL), "directory snapshot validity")
 	directoryClientTTL := flag.Duration("directory-client-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_CLIENT_TTL", directoryDefaultClientTTL), "dynamic directory client registration validity")
+	controlAuthPolicyDefault := os.Getenv("INCOMUDON_CONTROL_AUTH_POLICY")
+	if controlAuthPolicyDefault == "" {
+		controlAuthPolicyDefault = string(controlAuthOff)
+	}
+	controlAuthPolicyFlag := flag.String("control-auth-policy", controlAuthPolicyDefault, "control authentication policy: off, optional, or required")
+	controlKeyFile := flag.String("control-key-file", os.Getenv("INCOMUDON_CONTROL_KEY_FILE"), "CSV file containing channel_id,key_id,control_key_base64")
+	controlCookieSecretFile := flag.String("control-cookie-secret-file", os.Getenv("INCOMUDON_CONTROL_COOKIE_SECRET_FILE"), "file containing the Relay control cookie secret")
 	noCrypto := flag.Bool("no-crypto", false, "accept/send packets without security header/tag")
 	logPackets := flag.Bool("log-packets", false, "log received packets")
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
@@ -1078,6 +1193,25 @@ func main() {
 		*maxActiveTalkers = maxActiveTalkersV1
 	}
 	talkMax := time.Duration(*talkMaxSec) * time.Second
+	controlPolicy, err := parseControlAuthPolicy(*controlAuthPolicyFlag)
+	if err != nil {
+		log.Fatalf("invalid control authentication policy: %v", err)
+	}
+	if *noCrypto && controlPolicy == controlAuthRequired {
+		log.Fatal("-no-crypto cannot be used with required control authentication")
+	}
+	controlKeys, err := loadControlKeyStore(*controlKeyFile)
+	if err != nil {
+		log.Fatalf("invalid control key configuration: %v", err)
+	}
+	cookieSecret, err := loadCookieSecret(*controlCookieSecretFile)
+	if err != nil {
+		log.Fatalf("invalid control cookie secret: %v", err)
+	}
+	controlAuth, err := newControlAuthState(controlPolicy, controlKeys, cookieSecret)
+	if err != nil {
+		log.Fatalf("invalid control authentication configuration: %v", err)
+	}
 
 	addr := &net.UDPAddr{Port: *port}
 	conn, err := net.ListenUDP("udp", addr)
@@ -1086,6 +1220,7 @@ func main() {
 	}
 	defer conn.Close()
 	srv := newServer(conn, *noCrypto, *logPackets, *logAudio, talkMax, *multiTalk, *maxActiveTalkers)
+	srv.configureControlAuth(controlAuth)
 
 	directoryPublisher, err := newDirectoryPublisher(directoryPublisherConfig{
 		Enabled:           *directoryEnabled,
@@ -1122,7 +1257,7 @@ func main() {
 	if *noCrypto {
 		mode = "no-crypto"
 	}
-	log.Printf("IncomUdon relay listening on udp :%d (%s, talk_max=%ds, multi_talk=%t, max_active_talkers=%d)", *port, mode, *talkMaxSec, *multiTalk, *maxActiveTalkers)
+	log.Printf("IncomUdon relay listening on udp :%d (%s, control_auth=%s, talk_max=%ds, multi_talk=%t, max_active_talkers=%d)", *port, mode, controlPolicy, *talkMaxSec, *multiTalk, *maxActiveTalkers)
 
 	if *logAudio {
 		*logPackets = true
