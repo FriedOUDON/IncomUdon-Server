@@ -1,9 +1,15 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -393,6 +399,68 @@ func newRequiredControlAuthState(t *testing.T, channelID uint32) (*controlAuthSt
 	return state, key
 }
 
+func buildIdentityAdmissionTicket(t *testing.T, issuerPrivate ed25519.PrivateKey, issuer string, audience string, channelID uint32, senderID uint32, clientPublicKey ed25519.PublicKey, permissions uint8, priority *uint8) string {
+	t.Helper()
+	digest := sha256.Sum256(clientPublicKey)
+	header, err := json.Marshal(identityTicketHeader{Algorithm: "EdDSA", KeyID: "test-kid", Type: "incomudon-admission+jwt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	claims := identityTicketClaims{
+		Issuer: issuer, Audience: audience, Subject: "identity-test-subject", TicketID: "identity-test-ticket",
+		IssuedAt: now.Add(-time.Second).Unix(), ExpiresAt: now.Add(2 * time.Minute).Unix(),
+		ChannelID: channelID, SenderID: senderID, Permissions: permissions, Priority: priority,
+	}
+	claims.Confirmation.JWKThumbprint = base64.RawURLEncoding.EncodeToString(digest[:])
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
+	signature := ed25519.Sign(issuerPrivate, []byte(signingInput))
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature)
+}
+
+func identityBeginPayload(ticket string, publicKey ed25519.PublicKey) []byte {
+	payload := make([]byte, 2+len(ticket)+len(publicKey))
+	binary.BigEndian.PutUint16(payload[:2], uint16(len(ticket)))
+	copy(payload[2:], []byte(ticket))
+	copy(payload[2+len(ticket):], publicKey)
+	return payload
+}
+
+func buildServiceAdmissionGrant(t *testing.T, issuerPrivate ed25519.PrivateKey, issuer string, audience string, channelID uint32, senderID uint32, servicePublicKey ed25519.PublicKey, role string, permissions uint8, priority *uint8, graceSeconds *uint16) string {
+	t.Helper()
+	digest := sha256.Sum256(servicePublicKey)
+	header, err := json.Marshal(serviceGrantHeader{Algorithm: "EdDSA", KeyID: "test-service-kid", Type: "incomudon-service-admission+jwt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	claims := serviceGrantClaims{
+		Issuer: issuer, Audience: audience, ServiceID: "recorder-test-01", GrantID: "service-grant-test-0001",
+		IssuedAt: now.Add(-time.Second).Unix(), ExpiresAt: now.Add(2 * time.Minute).Unix(),
+		ChannelID: channelID, SenderID: senderID, Role: role, Permissions: permissions, Priority: priority, GraceSeconds: graceSeconds,
+	}
+	claims.Confirmation.JWKThumbprint = base64.RawURLEncoding.EncodeToString(digest[:])
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
+	signature := ed25519.Sign(issuerPrivate, []byte(signingInput))
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature)
+}
+
+func serviceAdmissionBeginPayload(grant string, publicKey ed25519.PublicKey) []byte {
+	payload := make([]byte, 2+len(grant)+len(publicKey))
+	binary.BigEndian.PutUint16(payload[:2], uint16(len(grant)))
+	copy(payload[2:], []byte(grant))
+	copy(payload[2+len(grant):], publicKey)
+	return payload
+}
+
 func TestControlAuthV1Vectors(t *testing.T) {
 	key, err := hex.DecodeString("f7bf50ee89a0e406253d1a31040a54ac9681e6bacdd4346251b365a757bd5153")
 	if err != nil {
@@ -728,8 +796,8 @@ func TestRelayReauthenticatedCodecConfigPreservesVerifiedControlKeyID(t *testing
 	if !verifyControlAuthPacket(forwarded, keyOne) || verifyControlAuthPacket(forwarded, keyTwo) {
 		t.Fatal("forwarded CODEC_CONFIG was not reauthenticated with the source control key")
 	}
-	if forwarded.Header.Seq == pkt.Header.Seq {
-		t.Fatal("forwarded CODEC_CONFIG reused the client fixed-header sequence")
+	if forwarded.Sec.ControlNonce == pkt.Sec.ControlNonce {
+		t.Fatal("forwarded CODEC_CONFIG reused the client control-authentication nonce")
 	}
 }
 
@@ -888,5 +956,632 @@ func TestMembershipExpiryReleasesTalkerAndClearsCodecState(t *testing.T) {
 	}
 	if _, exists := ch.mediaCodecConfigs[expiredSenderID]; exists {
 		t.Fatal("expired sender media CODEC_CONFIG cache was retained")
+	}
+}
+
+func TestIdentityAdmissionRequiredHandshakeAuthorizesTalk(t *testing.T) {
+	relay := newTestUDPConn(t)
+	client := newTestUDPConn(t)
+	const channelID uint32 = 85
+	const senderID uint32 = 7701
+	const sessionID uint32 = 0x55667788
+	issuer := "https://access.example.test"
+	audience := "relay-test"
+	issuerPrivate := ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef"))
+	issuerPublic := issuerPrivate.Public().(ed25519.PublicKey)
+	clientPrivate := ed25519.NewKeyFromSeed([]byte("abcdefghijklmnopqrstuvwxyz012345"))
+	clientPublic := clientPrivate.Public().(ed25519.PublicKey)
+
+	control, key := newRequiredControlAuthState(t, channelID)
+	identity, err := newIdentityAdmissionState(identityAdmissionRequired, issuer, audience, identitySigningKeyStore{"test-kid": issuerPublic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer(relay, false, false, false, 0, false, 1)
+	s.configureControlAuth(control)
+	s.configureIdentityAdmission(identity, false)
+
+	helloRaw := buildAuthenticatedControlPacket(pktAuthHello, channelID, senderID, nil, 1, key, uint64(sessionID)<<32)
+	hello, ok := parsePacket(helloRaw, false)
+	if !ok {
+		t.Fatal("parse AUTH_HELLO")
+	}
+	s.handlePacket(hello, client.LocalAddr().(*net.UDPAddr))
+	authChallenge := receiveTestPacket(t, client)
+	if authChallenge.Header.Type != pktAuthChallenge || !verifyControlAuthPacket(authChallenge, key) {
+		t.Fatal("expected authenticated AUTH_CHALLENGE")
+	}
+
+	ticket := buildIdentityAdmissionTicket(t, issuerPrivate, issuer, audience, channelID, senderID, clientPublic, identityPermissionListen|identityPermissionTalk, nil)
+	beginRaw := buildAuthenticatedControlPacket(pktIdentityBegin, channelID, senderID, identityBeginPayload(ticket, clientPublic), 1, key, uint64(sessionID)<<32|1)
+	begin, ok := parsePacket(beginRaw, false)
+	if !ok {
+		t.Fatal("parse IDENTITY_BEGIN")
+	}
+	s.handlePacket(begin, client.LocalAddr().(*net.UDPAddr))
+	identityChallenge := receiveTestPacket(t, client)
+	if identityChallenge.Header.Type != pktIdentityChallenge || len(identityChallenge.Payload) != 36 || !verifyControlAuthPacket(identityChallenge, key) {
+		t.Fatal("expected authenticated IDENTITY_CHALLENGE")
+	}
+	var challenge [32]byte
+	copy(challenge[:], identityChallenge.Payload[4:])
+	ticketHash := sha256.Sum256([]byte(ticket))
+	proofMessage := identityProofMessage(challenge, channelID, senderID, ticketHash)
+	proofRaw := buildAuthenticatedControlPacket(pktIdentityProof, channelID, senderID, ed25519.Sign(clientPrivate, proofMessage[:]), 1, key, uint64(sessionID)<<32|2)
+	proof, ok := parsePacket(proofRaw, false)
+	if !ok {
+		t.Fatal("parse IDENTITY_PROOF")
+	}
+	s.handlePacket(proof, client.LocalAddr().(*net.UDPAddr))
+	expectNoTestPacket(t, client)
+
+	joinRaw := buildAuthenticatedControlPacket(pktJoin, channelID, senderID, authChallenge.Payload, 1, key, uint64(sessionID)<<32|3)
+	join, ok := parsePacket(joinRaw, false)
+	if !ok {
+		t.Fatal("parse authenticated JOIN")
+	}
+	s.handlePacket(join, client.LocalAddr().(*net.UDPAddr))
+	serverConfig := receiveTestPacket(t, client)
+	if serverConfig.Header.Type != pktServerCfg || !verifyControlAuthPacket(serverConfig, key) {
+		t.Fatal("identity-admitted JOIN did not receive authenticated SERVER_CONFIG")
+	}
+	peer := s.channels[channelID].peers[peerMapKey(client.LocalAddr().(*net.UDPAddr))]
+	if peer == nil || peer.identityAdmission == nil || peer.identityAdmission.permissions != identityPermissionListen|identityPermissionTalk {
+		t.Fatal("identity admission was not attached to the joined peer")
+	}
+
+	pttRaw := buildAuthenticatedControlPacket(pktPttOn, channelID, senderID, nil, 1, key, uint64(sessionID)<<32|4)
+	ptt, ok := parsePacket(pttRaw, false)
+	if !ok {
+		t.Fatal("parse authenticated PTT_ON")
+	}
+	s.handlePacket(ptt, client.LocalAddr().(*net.UDPAddr))
+	grant := receiveTestPacket(t, client)
+	if grant.Header.Type != pktTalkGrant || !verifyControlAuthPacket(grant, key) || !s.isTalker(channelID, senderID) {
+		t.Fatal("talk-permitted identity admission did not receive TALK_GRANT")
+	}
+}
+
+func TestFloorInterruptPreemptsDeterministicLowestPriority(t *testing.T) {
+	relay := newTestUDPConn(t)
+	requesterAddr := newTestUDPConn(t)
+	firstVictimAddr := newTestUDPConn(t)
+	secondVictimAddr := newTestUDPConn(t)
+	thirdVictimAddr := newTestUDPConn(t)
+	observerAddr := newTestUDPConn(t)
+	const channelID uint32 = 86
+	const requesterID uint32 = 7800
+	const firstVictimID uint32 = 1001
+	const secondVictimID uint32 = 1005
+	const thirdVictimID uint32 = 1003
+	control, key := newRequiredControlAuthState(t, channelID)
+	identity, err := newIdentityAdmissionState(identityAdmissionRequired, "issuer", "audience", identitySigningKeyStore{"test": ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef")).Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	admission := func(priority uint8) *identityAdmission {
+		return &identityAdmission{permissions: identityPermissionListen | identityPermissionTalk | identityPermissionInterrupt, priority: priority, expiresAt: now.Add(time.Minute)}
+	}
+	peerFor := func(addr *net.UDPAddr, senderID uint32, sessionID uint32, priority uint8) *peer {
+		return &peer{addr: addr, senderId: senderID, authenticated: true, controlSessionID: sessionID, controlKeyID: 1, controlHighest: 3, controlSeenWindow: 1, identityAdmission: admission(priority), membershipLease: 30 * time.Second, keepaliveInterval: 10 * time.Second, membershipDeadline: now.Add(time.Minute)}
+	}
+	s := newServer(relay, false, false, false, 0, true, 3)
+	s.configureControlAuth(control)
+	s.configureIdentityAdmission(identity, true)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(requesterAddr.LocalAddr().(*net.UDPAddr)):    peerFor(requesterAddr.LocalAddr().(*net.UDPAddr), requesterID, 0x11111111, 80),
+			peerMapKey(firstVictimAddr.LocalAddr().(*net.UDPAddr)):  peerFor(firstVictimAddr.LocalAddr().(*net.UDPAddr), firstVictimID, 0x22222222, 20),
+			peerMapKey(secondVictimAddr.LocalAddr().(*net.UDPAddr)): peerFor(secondVictimAddr.LocalAddr().(*net.UDPAddr), secondVictimID, 0x33333333, 20),
+			peerMapKey(thirdVictimAddr.LocalAddr().(*net.UDPAddr)):  peerFor(thirdVictimAddr.LocalAddr().(*net.UDPAddr), thirdVictimID, 0x44444444, 40),
+			peerMapKey(observerAddr.LocalAddr().(*net.UDPAddr)):     peerFor(observerAddr.LocalAddr().(*net.UDPAddr), 7801, 0x55555555, 1),
+		},
+		activeTalkers: map[uint32]time.Time{firstVictimID: now, secondVictimID: now, thirdVictimID: now},
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	raw := buildAuthenticatedControlPacket(pktPttRequest, channelID, requesterID, []byte{0x01}, 1, key, uint64(0x11111111)<<32|4)
+	pkt, ok := parsePacket(raw, false)
+	if !ok {
+		t.Fatal("parse authenticated PTT_REQUEST")
+	}
+	s.handlePacket(pkt, requesterAddr.LocalAddr().(*net.UDPAddr))
+	release := receiveTestPacket(t, observerAddr)
+	grant := receiveTestPacket(t, observerAddr)
+	if release.Header.Type != pktTalkRelease || release.Header.SenderId != firstVictimID || len(release.Payload) != 5 || release.Payload[4] != talkReleasePreempted {
+		t.Fatalf("preemption release = type=%d sender=%d payload=%x", release.Header.Type, release.Header.SenderId, release.Payload)
+	}
+	if grant.Header.Type != pktTalkGrant || grant.Header.SenderId != requesterID {
+		t.Fatalf("preemption grant = type=%d sender=%d", grant.Header.Type, grant.Header.SenderId)
+	}
+	if !verifyControlAuthPacket(release, key) || !verifyControlAuthPacket(grant, key) {
+		t.Fatal("Floor Interrupt relay packets were not authenticated")
+	}
+	active := s.channels[channelID].activeTalkers
+	if _, exists := active[firstVictimID]; exists {
+		t.Fatal("lower sender ID among equal lowest priorities was not preempted")
+	}
+	if _, exists := active[secondVictimID]; !exists {
+		t.Fatal("Floor Interrupt preempted more than one active talker")
+	}
+	if _, exists := active[requesterID]; !exists {
+		t.Fatal("Floor Interrupt requester was not granted")
+	}
+}
+
+func TestFloorInterruptDeniesTalkOnlyAdmission(t *testing.T) {
+	relay := newTestUDPConn(t)
+	requesterAddr := newTestUDPConn(t)
+	victimAddr := newTestUDPConn(t)
+	const channelID uint32 = 87
+	const requesterID uint32 = 7900
+	const victimID uint32 = 7901
+	control, key := newRequiredControlAuthState(t, channelID)
+	identity, err := newIdentityAdmissionState(identityAdmissionRequired, "issuer", "audience", identitySigningKeyStore{"test": ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef")).Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	peerFor := func(addr *net.UDPAddr, senderID uint32, sessionID uint32, permissions uint8, priority uint8) *peer {
+		return &peer{addr: addr, senderId: senderID, authenticated: true, controlSessionID: sessionID, controlKeyID: 1, controlHighest: 3, controlSeenWindow: 1, identityAdmission: &identityAdmission{permissions: permissions, priority: priority, expiresAt: now.Add(time.Minute)}, membershipLease: 30 * time.Second, keepaliveInterval: 10 * time.Second, membershipDeadline: now.Add(time.Minute)}
+	}
+	s := newServer(relay, false, false, false, 0, false, 1)
+	s.configureControlAuth(control)
+	s.configureIdentityAdmission(identity, true)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(requesterAddr.LocalAddr().(*net.UDPAddr)): peerFor(requesterAddr.LocalAddr().(*net.UDPAddr), requesterID, 0x11111111, identityPermissionListen|identityPermissionTalk, 0),
+			peerMapKey(victimAddr.LocalAddr().(*net.UDPAddr)):    peerFor(victimAddr.LocalAddr().(*net.UDPAddr), victimID, 0x22222222, identityPermissionListen|identityPermissionTalk|identityPermissionInterrupt, 10),
+		},
+		activeTalkers: map[uint32]time.Time{victimID: now},
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	raw := buildAuthenticatedControlPacket(pktPttRequest, channelID, requesterID, []byte{0x01}, 1, key, uint64(0x11111111)<<32|4)
+	pkt, ok := parsePacket(raw, false)
+	if !ok {
+		t.Fatal("parse authenticated PTT_REQUEST")
+	}
+	s.handlePacket(pkt, requesterAddr.LocalAddr().(*net.UDPAddr))
+	deny := receiveTestPacket(t, requesterAddr)
+	if deny.Header.Type != pktTalkDeny || !verifyControlAuthPacket(deny, key) {
+		t.Fatal("talk-only PTT_REQUEST did not receive an authenticated TALK_DENY")
+	}
+	if !s.isTalker(channelID, victimID) || s.isTalker(channelID, requesterID) {
+		t.Fatal("denied PTT_REQUEST changed active talk state")
+	}
+}
+
+func TestIdentityAdmissionRejectsPriorityWithoutInterrupt(t *testing.T) {
+	issuerPrivate := ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef"))
+	issuerPublic := issuerPrivate.Public().(ed25519.PublicKey)
+	clientPrivate := ed25519.NewKeyFromSeed([]byte("abcdefghijklmnopqrstuvwxyz012345"))
+	clientPublic := clientPrivate.Public().(ed25519.PublicKey)
+	priority := uint8(20)
+	state, err := newIdentityAdmissionState(identityAdmissionRequired, "issuer", "audience", identitySigningKeyStore{"test-kid": issuerPublic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := buildIdentityAdmissionTicket(t, issuerPrivate, "issuer", "audience", 88, 7902, clientPublic, identityPermissionListen|identityPermissionTalk, &priority)
+	if _, reason := state.validateTicket(ticket, clientPublic, 88, 7902, time.Now()); reason != identityDenyPermissionDenied {
+		t.Fatalf("priority without interrupt = denial reason %d, want %d", reason, identityDenyPermissionDenied)
+	}
+}
+
+func TestIdentityAdmissionCanonicalVector(t *testing.T) {
+	issuerPublic, err := hex.DecodeString("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPublic, err := hex.DecodeString("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := newIdentityAdmissionState(identityAdmissionRequired, "https://access.example.test", "incomudon-relay-test", identitySigningKeyStore{"test-ed25519-1": ed25519.PublicKey(issuerPublic)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ticket = "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtZWQyNTUxOS0xIiwidHlwIjoiaW5jb211ZG9uLWFkbWlzc2lvbitqd3QifQ.eyJhdWQiOiJpbmNvbXVkb24tcmVsYXktdGVzdCIsImNoIjoxMDAsImNuZiI6eyJqa3QiOiJPZmNUMEtaRUpUOEVVcFFodWZVYm13aVhuUWdwV1ZuRTg1a081aGYxRTU4In0sImV4cCI6MTcwMDAwMDMwMCwiaWF0IjoxNzAwMDAwMDAwLCJpc3MiOiJodHRwczovL2FjY2Vzcy5leGFtcGxlLnRlc3QiLCJqdGkiOiJ0ZXN0LXRpY2tldC0wMDAxIiwicGVybSI6Mywic2lkIjoxMDAxLCJzdWIiOiJ1c2VyLXRlc3QtMTAwMSJ9.Y1A17MPwesje1zWhPXaXXuUVatokMqbS_sYJylDqICqvb5sfybY1GR9zKaWuI8SYuRQtfFrj5AMYom19brFyCQ"
+	admission, reason := state.validateTicket(ticket, ed25519.PublicKey(clientPublic), 100, 1001, time.Unix(1700000010, 0))
+	if reason != 0 || admission.permissions != identityPermissionListen|identityPermissionTalk || admission.expiresAt.Unix() != 1700000300 {
+		t.Fatalf("canonical admission = %+v, denial reason = %d", admission, reason)
+	}
+
+	challengeRaw, err := hex.DecodeString("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var challenge [32]byte
+	copy(challenge[:], challengeRaw)
+	message := identityProofMessage(challenge, 100, 1001, admission.ticketHash)
+	if got := hex.EncodeToString(message[:]); got != "61ac99aabf2270d5497ddd17452efd49ca768d6787ceb9ffc96797f26ae7697c" {
+		t.Fatalf("canonical proof message = %s", got)
+	}
+	proof, err := hex.DecodeString("44a06fc1eecfab3a598c42ae5805e23532b1439c8b6803ec0e2e60f54453b056f6fc99296c81e8c67657beb74ce7fe072a6f6cdb4d581fc466756673befab005")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(clientPublic), message[:], proof) {
+		t.Fatal("canonical identity proof did not verify")
+	}
+}
+
+func TestManagedServiceAdmissionRequiredHandshakeAuthorizesReceiveOnlyJoin(t *testing.T) {
+	relay := newTestUDPConn(t)
+	service := newTestUDPConn(t)
+	const channelID uint32 = 89
+	const senderID uint32 = 8001
+	const sessionID uint32 = 0x55667799
+	issuer := "https://management.example.test"
+	audience := "relay-test"
+	issuerPrivate := ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef"))
+	issuerPublic := issuerPrivate.Public().(ed25519.PublicKey)
+	servicePrivate := ed25519.NewKeyFromSeed([]byte("abcdefghijklmnopqrstuvwxyz012345"))
+	servicePublic := servicePrivate.Public().(ed25519.PublicKey)
+
+	control, key := newRequiredControlAuthState(t, channelID)
+	identity, err := newIdentityAdmissionState(identityAdmissionRequired, "identity-issuer", audience, identitySigningKeyStore{"identity": issuerPublic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceState, err := newServiceAdmissionState(serviceAdmissionEnabled, issuer, audience, serviceSigningKeyStore{"test-service-kid": issuerPublic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer(relay, false, false, false, 0, false, 1)
+	s.configureControlAuth(control)
+	s.configureIdentityAdmission(identity, false)
+	s.configureServiceAdmission(serviceState)
+
+	helloRaw := buildAuthenticatedControlPacket(pktAuthHello, channelID, senderID, nil, 1, key, uint64(sessionID)<<32)
+	hello, ok := parsePacket(helloRaw, false)
+	if !ok {
+		t.Fatal("parse AUTH_HELLO")
+	}
+	s.handlePacket(hello, service.LocalAddr().(*net.UDPAddr))
+	authChallenge := receiveTestPacket(t, service)
+	if authChallenge.Header.Type != pktAuthChallenge || !verifyControlAuthPacket(authChallenge, key) {
+		t.Fatal("expected authenticated AUTH_CHALLENGE")
+	}
+
+	graceSeconds := uint16(120)
+	grant := buildServiceAdmissionGrant(t, issuerPrivate, issuer, audience, channelID, senderID, servicePublic, "recorder", identityPermissionListen, nil, &graceSeconds)
+	beginRaw := buildAuthenticatedControlPacket(pktServiceBegin, channelID, senderID, serviceAdmissionBeginPayload(grant, servicePublic), 1, key, uint64(sessionID)<<32|1)
+	begin, ok := parsePacket(beginRaw, false)
+	if !ok {
+		t.Fatal("parse SERVICE_ADMISSION_BEGIN")
+	}
+	s.handlePacket(begin, service.LocalAddr().(*net.UDPAddr))
+	challengePacket := receiveTestPacket(t, service)
+	if challengePacket.Header.Type != pktServiceChallenge || len(challengePacket.Payload) != 36 || !verifyControlAuthPacket(challengePacket, key) {
+		t.Fatal("expected authenticated SERVICE_ADMISSION_CHALLENGE")
+	}
+	var challenge [32]byte
+	copy(challenge[:], challengePacket.Payload[4:])
+	grantHash := sha256.Sum256([]byte(grant))
+	proofMessage := serviceProofMessage(challenge, channelID, senderID, grantHash)
+	proofRaw := buildAuthenticatedControlPacket(pktServiceProof, channelID, senderID, ed25519.Sign(servicePrivate, proofMessage[:]), 1, key, uint64(sessionID)<<32|2)
+	proof, ok := parsePacket(proofRaw, false)
+	if !ok {
+		t.Fatal("parse SERVICE_ADMISSION_PROOF")
+	}
+	s.handlePacket(proof, service.LocalAddr().(*net.UDPAddr))
+	expectNoTestPacket(t, service)
+
+	joinRaw := buildAuthenticatedControlPacket(pktJoin, channelID, senderID, authChallenge.Payload, 1, key, uint64(sessionID)<<32|3)
+	join, ok := parsePacket(joinRaw, false)
+	if !ok {
+		t.Fatal("parse authenticated JOIN")
+	}
+	s.handlePacket(join, service.LocalAddr().(*net.UDPAddr))
+	serverConfig := receiveTestPacket(t, service)
+	if serverConfig.Header.Type != pktServerCfg || !verifyControlAuthPacket(serverConfig, key) {
+		t.Fatal("service-admitted JOIN did not receive authenticated SERVER_CONFIG")
+	}
+	peer := s.channels[channelID].peers[peerMapKey(service.LocalAddr().(*net.UDPAddr))]
+	if peer == nil || peer.serviceAdmission == nil || peer.serviceAdmission.permissions != identityPermissionListen {
+		t.Fatal("service admission was not attached to the joined peer")
+	}
+
+	pttRaw := buildAuthenticatedControlPacket(pktPttOn, channelID, senderID, nil, 1, key, uint64(sessionID)<<32|4)
+	ptt, ok := parsePacket(pttRaw, false)
+	if !ok {
+		t.Fatal("parse authenticated PTT_ON")
+	}
+	s.handlePacket(ptt, service.LocalAddr().(*net.UDPAddr))
+	expectNoTestPacket(t, service)
+	if s.isTalker(channelID, senderID) {
+		t.Fatal("receive-only service admission was allowed to talk")
+	}
+}
+
+func TestManagedServiceAdmissionCanonicalVector(t *testing.T) {
+	issuerPublic, err := hex.DecodeString("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicePublic, err := hex.DecodeString("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := newServiceAdmissionState(serviceAdmissionEnabled, "https://management.example.test", "incomudon-relay-test", serviceSigningKeyStore{"test-management-ed25519-1": ed25519.PublicKey(issuerPublic)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const grant = "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtbWFuYWdlbWVudC1lZDI1NTE5LTEiLCJ0eXAiOiJpbmNvbXVkb24tc2VydmljZS1hZG1pc3Npb24rand0In0.eyJhdWQiOiJpbmNvbXVkb24tcmVsYXktdGVzdCIsImNoIjoxMDAsImNuZiI6eyJqa3QiOiJPZmNUMEtaRUpUOEVVcFFodWZVYm13aVhuUWdwV1ZuRTg1a081aGYxRTU4In0sImV4cCI6MTcwMDAwMDYwMCwiZ3JhY2Vfc2Vjb25kcyI6MzAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6Imh0dHBzOi8vbWFuYWdlbWVudC5leGFtcGxlLnRlc3QiLCJqdGkiOiJ0ZXN0LXNlcnZpY2UtZ3JhbnQtMDAwMSIsInBlcm0iOjEsInJvbGUiOiJyZWNvcmRlciIsInNpZCI6MjAwMSwic3ZjIjoicmVjb3JkZXItdGVzdC0wMSJ9.zrmPPWN2UgrFsp-jn9uHlTTllplR98_WPChtiMemnMBTjsTz4QNRZ9aESxmGoyXVDYKIw2PK7UEEF1hH7qrYBg"
+	admission, reason := state.validateGrant(grant, ed25519.PublicKey(servicePublic), 100, 2001, time.Unix(1700000010, 0))
+	if reason != 0 || admission.permissions != identityPermissionListen || admission.grace != 300*time.Second || admission.grantExpires.Unix() != 1700000600 {
+		t.Fatalf("canonical service admission = %+v, denial reason = %d", admission, reason)
+	}
+
+	challengeRaw, err := hex.DecodeString("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var challenge [32]byte
+	copy(challenge[:], challengeRaw)
+	message := serviceProofMessage(challenge, 100, 2001, admission.grantHash)
+	if got := hex.EncodeToString(message[:]); got != "a92131d64a7f26ea8cec733ae2d6974cc8a95cbea5d2cc48c3ff0989f48ceb35" {
+		t.Fatalf("canonical service proof message = %s", got)
+	}
+	proof, err := hex.DecodeString("c95380808129f3e774413c77394f4c694d2b31fab7c7e56d2c79c086b5533f3cf4222ba30a47e2cf27c86ed9ec507488c365b78487f86a25d1d85f2636658302")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(servicePublic), message[:], proof) {
+		t.Fatal("canonical service proof did not verify")
+	}
+}
+
+func TestManagedServiceAdmissionRejectsUnknownGrantClaims(t *testing.T) {
+	issuer := ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef"))
+	servicePrivate := ed25519.NewKeyFromSeed([]byte("abcdefghijklmnopqrstuvwxyz012345"))
+	servicePublic := servicePrivate.Public().(ed25519.PublicKey)
+	state, err := newServiceAdmissionState(serviceAdmissionEnabled, "issuer", "audience", serviceSigningKeyStore{"test": issuer.Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := json.Marshal(serviceGrantHeader{Algorithm: "EdDSA", KeyID: "test", Type: "incomudon-service-admission+jwt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDigest := sha256.Sum256(servicePublic)
+	claims := map[string]any{
+		"iss": "issuer", "aud": "audience", "svc": "recorder-01", "jti": "service-grant-0001",
+		"iat": time.Now().Add(-time.Minute).Unix(), "exp": time.Now().Add(time.Minute).Unix(), "ch": 100, "sid": 2001,
+		"role": "recorder", "perm": 1, "cnf": map[string]string{"jkt": base64.RawURLEncoding.EncodeToString(keyDigest[:])},
+		"unexpected": true,
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
+	grant := signingInput + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(issuer, []byte(signingInput)))
+	if _, reason := state.validateGrant(grant, servicePublic, 100, 2001, time.Now()); reason != serviceDenyInvalidGrant {
+		t.Fatalf("unknown claim denial reason = %d", reason)
+	}
+}
+
+func TestManagedServiceAdmissionExpiryReasonsAndGrace(t *testing.T) {
+	now := time.Now()
+	peer := &peer{membershipDeadline: now.Add(5 * time.Second), serviceAdmission: &serviceAdmission{permissions: identityPermissionListen | identityPermissionTalk, grantExpires: now.Add(-time.Second)}}
+	if reason, expired := membershipExpired(peer, now); !expired || reason != talkReleaseServiceExpired {
+		t.Fatalf("service-first expiry = reason %d expired %t", reason, expired)
+	}
+	deadline := now.Add(-time.Second)
+	peer.membershipDeadline = deadline
+	peer.serviceAdmission.grantExpires = deadline
+	if reason, expired := membershipExpired(peer, now); !expired || reason != talkReleaseMembershipTimeout {
+		t.Fatalf("equal expiry = reason %d expired %t", reason, expired)
+	}
+	peer.membershipDeadline = now.Add(time.Minute)
+	peer.serviceAdmission = &serviceAdmission{permissions: identityPermissionListen, grantExpires: now.Add(-time.Second), grace: 30 * time.Second}
+	if _, expired := membershipExpired(peer, now); expired {
+		t.Fatal("receive-only service grace did not retain membership")
+	}
+}
+
+func TestIdentityExpiryReasonPrefersNormalMembershipOnTie(t *testing.T) {
+	now := time.Now()
+	peer := &peer{membershipDeadline: now.Add(5 * time.Second), identityAdmission: &identityAdmission{expiresAt: now.Add(-time.Second)}}
+	if reason, expired := membershipExpired(peer, now); !expired || reason != talkReleaseIdentityExpired {
+		t.Fatalf("identity-first expiry = reason %d expired %t", reason, expired)
+	}
+	deadline := now.Add(-time.Second)
+	peer.membershipDeadline = deadline
+	peer.identityAdmission.expiresAt = deadline
+	if reason, expired := membershipExpired(peer, now); !expired || reason != talkReleaseMembershipTimeout {
+		t.Fatalf("equal expiry = reason %d expired %t", reason, expired)
+	}
+}
+
+func TestFloorInterruptControlAuthenticationVectors(t *testing.T) {
+	key, err := hex.DecodeString("f7bf50ee89a0e406253d1a31040a54ac9681e6bacdd4346251b365a757bd5153")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestExpected, err := hex.DecodeString("011a001c0000006f000003ea002d000212345678000000040000000101c107ff2f229865a400b023975bdf0b12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := buildAuthenticatedControlPacketWithSeq(pktPttRequest, 111, 1002, []byte{0x01}, 1, key, 0x1234567800000004, 45)
+	if string(request) != string(requestExpected) {
+		t.Fatalf("PTT_REQUEST vector mismatch: got=%x want=%x", request, requestExpected)
+	}
+	parsedRequest, ok := parsePacket(request, false)
+	if !ok || !verifyControlAuthPacket(parsedRequest, key) {
+		t.Fatal("PTT_REQUEST vector did not verify")
+	}
+
+	releaseExpected, err := hex.DecodeString("0108001c0000006f000003e900020002876543210000000200000001000003e907518224376c042d8280ae23ce40528737")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := buildAuthenticatedControlPacketWithSeq(pktTalkRelease, 111, 1001, talkReleasePayload(1001, talkReleasePreempted), 1, key, 0x8765432100000002, 2)
+	if string(release) != string(releaseExpected) {
+		t.Fatalf("PREEMPTED TALK_RELEASE vector mismatch: got=%x want=%x", release, releaseExpected)
+	}
+	parsedRelease, ok := parsePacket(release, false)
+	if !ok || !verifyControlAuthPacket(parsedRelease, key) {
+		t.Fatal("PREEMPTED TALK_RELEASE vector did not verify")
+	}
+}
+
+func newTestManagementPlane(t *testing.T, server *server, apiRole string) (*managementPlane, *managementService, ed25519.PrivateKey) {
+	t.Helper()
+	privateKey := ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef"))
+	service := &managementService{serviceID: "recorder-01", apiRole: apiRole, enabled: true, global: make(map[string]bool)}
+	policy := managementPolicy{
+		byCertificate: map[string]*managementService{}, byService: map[string]*managementService{service.serviceID: service},
+		acls: map[string]map[uint32]map[uint32]managementChannelACL{
+			service.serviceID: {
+				100: {9001: {serviceID: service.serviceID, channelID: 100, senderID: 9001, admissionRole: "recorder", allowListen: true, enabled: true}},
+			},
+		},
+	}
+	plane, err := newManagementPlane(server, policy, managementGrantSigner{keyID: "management-test-key", key: privateKey}, "https://management.example.test", "relay-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.management = plane
+	return plane, service, privateKey
+}
+
+func TestManagementPlaneIssuesVerifiableServiceGrant(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, service, privateKey := newTestManagementPlane(t, s, "recorder")
+	verificationState, err := newServiceAdmissionState(serviceAdmissionEnabled, "https://management.example.test", "relay-test", serviceSigningKeyStore{"management-test-key": privateKey.Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicePrivate := ed25519.NewKeyFromSeed([]byte("abcdefghijklmnopqrstuvwxyz012345"))
+	servicePublic := servicePrivate.Public().(ed25519.PublicKey)
+	grant, expiresAt, permissions, priority, err := plane.issueGrant(service, serviceGrantRequest{ChannelID: 100, SenderID: 9001, Role: "recorder", ServicePublicKey: base64.RawURLEncoding.EncodeToString(servicePublic)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if permissions != identityPermissionListen || priority != 0 || !expiresAt.After(time.Now()) {
+		t.Fatalf("issued grant metadata = permissions %d priority %d expires %s", permissions, priority, expiresAt)
+	}
+	admission, reason := verificationState.validateGrant(grant, servicePublic, 100, 9001, time.Now())
+	if reason != 0 || admission.serviceID != service.serviceID || admission.permissions != identityPermissionListen {
+		t.Fatalf("issued grant did not verify: %+v reason=%d", admission, reason)
+	}
+	if _, _, _, _, err := plane.issueGrant(service, serviceGrantRequest{ChannelID: 100, SenderID: 9001, Role: "recorder", RequestTalk: true, ServicePublicKey: base64.RawURLEncoding.EncodeToString(servicePublic)}); err == nil {
+		t.Fatal("receive-only recorder ACL issued a talk-capable grant")
+	}
+}
+
+func TestManagementAuditRetrievalEnforcesScopeAndPaginates(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, service, _ := newTestManagementPlane(t, s, "auditor")
+	plane.appendAudit(managementAuditRecord{ActorType: "service", ActorID: "controller", ChannelID: uint32Pointer(100), Action: "recording_start", Result: "success", RecordingJob: &managementRecordingJobAudit{JobID: "job-1", RecorderServiceID: "recorder-01"}})
+	plane.appendAudit(managementAuditRecord{ActorType: "identity", ActorID: "identity-redacted", ChannelID: uint32Pointer(100), Action: "floor_interrupt", Result: "denied", FloorInterrupt: &managementFloorInterruptAudit{RequesterPriority: 10}})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/audit-records?channel_id=100&limit=1", nil)
+	response := httptest.NewRecorder()
+	plane.handleAuditRecords(response, request, service)
+	if response.Code != http.StatusOK {
+		t.Fatalf("first audit page status = %d: %s", response.Code, response.Body.String())
+	}
+	var page struct {
+		SchemaVersion string                  `json:"schema_version"`
+		Records       []managementAuditRecord `json:"records"`
+		NextCursor    *string                 `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.SchemaVersion != "audit-retrieval-v1" || len(page.Records) != 1 || page.NextCursor == nil || page.Records[0].Action != "floor_interrupt" {
+		t.Fatalf("first audit page = %+v", page)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/v1/audit-records?channel_id=100&limit=1&cursor="+*page.NextCursor, nil)
+	response = httptest.NewRecorder()
+	plane.handleAuditRecords(response, request, service)
+	if response.Code != http.StatusOK {
+		t.Fatalf("second audit page status = %d", response.Code)
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Records) != 1 || page.Records[0].Action != "recording_start" || page.NextCursor != nil {
+		t.Fatalf("second audit page = %+v", page)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/v1/audit-records?channel_id=101", nil)
+	response = httptest.NewRecorder()
+	plane.handleAuditRecords(response, request, service)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("unauthorized audit channel status = %d", response.Code)
+	}
+}
+
+func TestManagementEventAuthorizationScopes(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, service, _ := newTestManagementPlane(t, s, "auditor")
+	if !plane.eventAllowed(service, managementEvent{Type: "talk_started", ChannelID: uint32Pointer(100)}) || plane.eventAllowed(service, managementEvent{Type: "talk_started", ChannelID: uint32Pointer(101)}) {
+		t.Fatal("channel-scoped event ACL filtering is incorrect")
+	}
+	if plane.eventAllowed(service, managementEvent{Type: "relay_health_changed", ChannelID: nil}) {
+		t.Fatal("channel-scoped auditor role incorrectly received global health event")
+	}
+	service.global["health.read"] = true
+	if !plane.eventAllowed(service, managementEvent{Type: "relay_health_changed", ChannelID: nil}) || plane.eventAllowed(service, managementEvent{Type: "talk_started", ChannelID: uint32Pointer(101)}) {
+		t.Fatal("explicit health.read did not preserve global/channel event separation")
+	}
+}
+
+func TestFloorInterruptUsesDefaultRedactedAuditSink(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	if s.management == nil {
+		t.Fatal("new Relay has no default audit sink")
+	}
+	priority := uint8(200)
+	s.auditFloorInterrupt(100, &peer{identityAdmission: &identityAdmission{actorIDHash: [16]byte{1}, expiresAt: time.Now().Add(time.Minute), priority: priority}}, priority, "denied", nil, nil)
+	if len(s.management.audit) != 1 {
+		t.Fatalf("default audit sink records = %d", len(s.management.audit))
+	}
+	record := s.management.audit[0]
+	if record.Action != "floor_interrupt" || record.Result != "denied" || record.FloorInterrupt == nil || record.FloorInterrupt.RequesterPriority != priority || record.FloorInterrupt.ReplacedSenderID != nil || record.FloorInterrupt.ReplacedPriority != nil {
+		t.Fatalf("default audit record = %+v", record)
+	}
+}
+
+func TestManagementDisabledACLDoesNotAuthorizeChannelScope(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, service, _ := newTestManagementPlane(t, s, "viewer")
+	acl := plane.policy.acls[service.serviceID][100][9001]
+	acl.enabled = false
+	plane.policy.acls[service.serviceID][100][9001] = acl
+	if plane.canViewChannel(service, 100) || plane.hasAnyChannelACL(service.serviceID) {
+		t.Fatal("disabled Management ACL granted channel visibility")
+	}
+	response := httptest.NewRecorder()
+	plane.handleChannels(response, httptest.NewRequest(http.MethodGet, "/v1/channels", nil), service)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("disabled Management ACL list status = %d", response.Code)
+	}
+}
+
+func TestManagedServiceRevocationRemovesMembership(t *testing.T) {
+	relay := newTestUDPConn(t)
+	serviceAddr := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	now := time.Now()
+	grantHash := sha256.Sum256([]byte("revoked-grant"))
+	s.configureServiceAdmission(&serviceAdmissionState{mode: serviceAdmissionEnabled, pending: make(map[serviceAdmissionKey]servicePendingAdmission), verified: make(map[serviceAdmissionKey]serviceAdmission), failed: make(map[serviceAdmissionKey]serviceAdmissionFailure), revoked: make(map[[sha256.Size]byte]time.Time), revokedServices: make(map[string]time.Time)})
+	s.channels[100] = &channel{peers: map[string]*peer{peerMapKey(serviceAddr.LocalAddr().(*net.UDPAddr)): {addr: serviceAddr.LocalAddr().(*net.UDPAddr), senderId: 9001, membershipDeadline: now.Add(time.Minute), serviceAdmission: &serviceAdmission{serviceID: "recorder-01", permissions: identityPermissionListen | identityPermissionTalk, grantExpires: now.Add(time.Minute), grantHash: grantHash}}}, activeTalkers: map[uint32]time.Time{9001: now}, codecConfigs: make(map[uint32][]byte), mediaCodecConfigs: make(map[uint32]codecConfigState)}
+	s.revokeManagedServiceAdmission("recorder-01", &grantHash)
+	if channel := s.channels[100]; channel != nil {
+		if _, found := channel.peers[peerMapKey(serviceAddr.LocalAddr().(*net.UDPAddr))]; found || s.isTalker(100, 9001) {
+			t.Fatal("revocation retained the managed service membership or active talker")
+		}
 	}
 }

@@ -158,6 +158,124 @@ INCOMUDON_CONTROL_COOKIE_SECRET_FILE=/run/incomudon-control/cookie.secret
 packets with `sender_id = 0` are rejected before they can create membership,
 talk, or authentication state; zero remains reserved for Relay/System packets.
 
+## Identity Admission and Floor Interrupt
+
+Identity Admission v1 verifies compact Ed25519-signed admission tickets from
+the configured Access Service. Every `IDENTITY_*` packet uses the existing
+Control Authentication session; a successful proof binds the ticket to the
+client UDP endpoint, its sender ID, and its Ed25519 public key. `required`
+mode denies JOIN, PTT, and media forwarding until the endpoint has a current
+admission. `optional` mode preserves legacy JOIN behavior, but enforces the
+permissions of a ticket once a client presents one.
+
+```bash
+INCOMUDON_CONTROL_AUTH_POLICY=required \
+INCOMUDON_IDENTITY_ADMISSION_MODE=required \
+INCOMUDON_IDENTITY_ISSUER=https://access.example.example \
+INCOMUDON_IDENTITY_AUDIENCE=incomudon-relay-production \
+INCOMUDON_IDENTITY_SIGNING_KEY_FILE=./identity/signing-keys.csv \
+go run . -port 50000
+```
+
+The signing-key CSV is Relay-local configuration and supports overlapping key
+rotation:
+
+```csv
+kid,ed25519_public_key_base64
+access-ed25519-2026-01,BASE64_ENCODED_32_BYTE_ED25519_PUBLIC_KEY
+```
+
+Floor Interrupt v1 is disabled by default. Enable it only together with
+Identity Admission `required` and Control Authentication `required`:
+
+```bash
+INCOMUDON_FLOOR_INTERRUPT_ENABLED=true go run . -port 50000
+```
+
+An authenticated `PTT_REQUEST` is granted only when the current ticket has
+`listen`, `talk`, and `interrupt` permissions with a non-zero admission-derived
+priority. On a full channel, the Relay preempts exactly one lowest-priority
+talker (lower `sender_id` breaks equal-priority ties), broadcasts an
+authenticated `TALK_RELEASE(PREEMPTED)`, and then grants the requester. The
+request packet never carries a caller-selected priority.
+
+## Managed Service Admission and Management Plane
+
+Managed Service Admission v1 is disabled by default. It lets a recorder,
+observer, or automation service complete the normal authenticated JOIN flow
+with a short-lived, Management Service-issued Ed25519 grant and a
+proof-of-possession signature. It never replaces the channel credential,
+Control Authentication, media authentication, membership lease, or ordinary
+floor policy.
+
+Enable the Relay-side verifier with a Control Authentication key and a public
+signing-key CSV:
+
+```bash
+INCOMUDON_CONTROL_AUTH_POLICY=required \
+INCOMUDON_SERVICE_ADMISSION_MODE=enabled \
+INCOMUDON_SERVICE_ADMISSION_ISSUER=https://management.example.example \
+INCOMUDON_SERVICE_ADMISSION_AUDIENCE=incomudon-relay-production \
+INCOMUDON_SERVICE_ADMISSION_SIGNING_KEY_FILE=./service-admission/verification-keys.csv \
+go run . -port 50000
+```
+
+```csv
+kid,ed25519_public_key_base64
+management-ed25519-2026-01,BASE64_ENCODED_32_BYTE_ED25519_PUBLIC_KEY
+```
+
+The optional Management Plane is a separate mTLS HTTPS listener for the
+canonical `/v1` management API. Bind it only to an administration network,
+VPN, or private interface; do not expose it alongside the public UDP relay
+port. The Compose file intentionally does **not** publish a management TCP
+port. Publish one only through a private network or reverse proxy with the
+same mTLS boundary.
+
+Direct single-process Management Plane mode requires the Relay service
+admission verifier to trust the public half of the configured Management
+signing key. It loads the canonical Management service and channel ACL CSVs:
+
+`management-services.csv`:
+
+```csv
+service_id,certificate_sha256,api_role,enabled
+recorder-east,LOWERCASE_SHA256_OF_DER_CLIENT_CERTIFICATE,recorder,true
+```
+
+`management-channel-acl.csv`:
+
+```csv
+service_id,channel_id,sender_id,admission_role,allow_listen,allow_talk,allow_interrupt,interrupt_priority,enabled
+recorder-east,111,9001,recorder,true,false,false,0,true
+```
+
+`management-global-permissions.csv` is an implementation-specific optional
+file for explicit non-channel permissions. Its strict format is
+`service_id,permission,enabled`; this Relay recognizes only `health.read` and
+`audit.read`. The private signing-key file is likewise Relay-local and has
+the strict header `kid,ed25519_private_key_base64`; it contains one standard
+Base64 Ed25519 seed (32 bytes) or private key (64 bytes), and must be protected
+as a secret.
+
+```bash
+INCOMUDON_MANAGEMENT_ENABLED=true \
+INCOMUDON_MANAGEMENT_LISTEN=127.0.0.1:8443 \
+INCOMUDON_MANAGEMENT_CERT_FILE=./management/server.crt \
+INCOMUDON_MANAGEMENT_KEY_FILE=./management/server.key \
+INCOMUDON_MANAGEMENT_CLIENT_CA_FILE=./management/client-ca.crt \
+INCOMUDON_MANAGEMENT_SERVICES_CSV=./management/management-services.csv \
+INCOMUDON_MANAGEMENT_CHANNEL_ACL_CSV=./management/management-channel-acl.csv \
+INCOMUDON_MANAGEMENT_SIGNING_KEY_FILE=./management/signing-key.csv \
+go run . -port 50000
+```
+
+The Relay retains redacted audit/event history in a bounded in-memory sink for
+the process lifetime; the enabled Management Plane exposes the retained audit
+records and events subject to its mTLS ACLs. A production deployment should
+place durable audit or revocation integration behind its private management
+boundary.
+
 ## Directory Provisioning
 
 For PSK-protected channel and speaker name provisioning to a PWA server, see
@@ -181,7 +299,8 @@ docker compose down
 `compose.yaml` publishes UDP port `50000` by default and passes the relay's
 server configuration through environment variables. Create a `.env` file next
 to `compose.yaml` when persistent configuration is required; the available
-keys and defaults are documented in `.env.example`.
+keys and defaults are documented in `.env.example`. It does not publish the
+optional Management Plane HTTPS port.
 
 For example, to allow two simultaneous transmitters and set a 60-second TX
 timeout:

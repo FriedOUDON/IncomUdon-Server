@@ -33,23 +33,32 @@ const (
 )
 
 const (
-	pktAudio         = 0x01
-	pktPttOn         = 0x02
-	pktPttOff        = 0x03
-	pktKeepalive     = 0x04
-	pktJoin          = 0x05
-	pktLeave         = 0x06
-	pktTalkGrant     = 0x07
-	pktTalkRelease   = 0x08
-	pktTalkDeny      = 0x09
-	pktKeyExchange   = 0x0A
-	pktCodecConfig   = 0x0B
-	pktFec           = 0x0C
-	pktServerCfg     = 0x0D
-	pktPing          = 0x0E
-	pktPong          = 0x0F
-	pktAuthHello     = 0x10
-	pktAuthChallenge = 0x11
+	pktAudio             = 0x01
+	pktPttOn             = 0x02
+	pktPttOff            = 0x03
+	pktKeepalive         = 0x04
+	pktJoin              = 0x05
+	pktLeave             = 0x06
+	pktTalkGrant         = 0x07
+	pktTalkRelease       = 0x08
+	pktTalkDeny          = 0x09
+	pktKeyExchange       = 0x0A
+	pktCodecConfig       = 0x0B
+	pktFec               = 0x0C
+	pktServerCfg         = 0x0D
+	pktPing              = 0x0E
+	pktPong              = 0x0F
+	pktAuthHello         = 0x10
+	pktAuthChallenge     = 0x11
+	pktIdentityBegin     = 0x12
+	pktIdentityChallenge = 0x13
+	pktIdentityProof     = 0x14
+	pktIdentityDeny      = 0x15
+	pktServiceBegin      = 0x16
+	pktServiceChallenge  = 0x17
+	pktServiceProof      = 0x18
+	pktServiceDeny       = 0x19
+	pktPttRequest        = 0x1A
 )
 
 const (
@@ -98,6 +107,8 @@ type peer struct {
 	controlKeyID       uint32
 	controlHighest     uint32
 	controlSeenWindow  uint64
+	identityAdmission  *identityAdmission
+	serviceAdmission   *serviceAdmission
 	membershipLease    time.Duration
 	keepaliveInterval  time.Duration
 	membershipDeadline time.Time
@@ -135,6 +146,10 @@ type server struct {
 	multiTalk           bool
 	maxActiveTalkers    int
 	controlAuth         *controlAuthState
+	identityAdmission   *identityAdmissionState
+	serviceAdmission    *serviceAdmissionState
+	management          *managementPlane
+	floorInterrupt      bool
 	membershipLease     time.Duration
 	keepaliveInterval   time.Duration
 	outboundMu          sync.Mutex
@@ -155,7 +170,7 @@ func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool,
 	if maxActiveTalkers > maxActiveTalkersV1 {
 		maxActiveTalkers = maxActiveTalkersV1
 	}
-	return &server{
+	server := &server{
 		channels:          make(map[uint32]*channel),
 		conn:              conn,
 		noCrypto:          noCrypto,
@@ -168,10 +183,23 @@ func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool,
 		membershipLease:   defaultMembershipLease,
 		keepaliveInterval: defaultKeepaliveInterval,
 	}
+	// Retain redacted audit data even when the optional HTTPS Management Plane
+	// listener is disabled. Enabling the listener later promotes this sink.
+	server.management = newManagementAuditSink(server)
+	return server
 }
 
 func (s *server) configureControlAuth(state *controlAuthState) {
 	s.controlAuth = state
+}
+
+func (s *server) configureIdentityAdmission(state *identityAdmissionState, floorInterrupt bool) {
+	s.identityAdmission = state
+	s.floorInterrupt = floorInterrupt
+}
+
+func (s *server) configureServiceAdmission(state *serviceAdmissionState) {
+	s.serviceAdmission = state
 }
 
 func validMembershipTiming(lease time.Duration, keepalive time.Duration) bool {
@@ -327,6 +355,87 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		s.sendPong(addr, pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload)
 		return
 	}
+	if (pkt.Header.Type == pktIdentityBegin || pkt.Header.Type == pktIdentityProof) && s.identityAdmission != nil {
+		if !requiresAuth {
+			return
+		}
+		meta, ok := s.verifyIncomingControl(pkt)
+		if !ok {
+			return
+		}
+		existingPeer := s.isAuthenticatedPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
+		if existingPeer {
+			if !s.acceptAuthenticatedPeerControl(pkt, addr, meta) {
+				return
+			}
+		} else if !s.controlAuth.acceptPreJoinControl(pkt, addr, meta) {
+			return
+		}
+		now := time.Now()
+		switch pkt.Header.Type {
+		case pktIdentityBegin:
+			challenge, denyReason := s.identityAdmission.begin(pkt, addr, meta, now)
+			if denyReason != 0 {
+				s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktIdentityDeny, []byte{denyReason})
+				return
+			}
+			s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktIdentityChallenge, challenge)
+		case pktIdentityProof:
+			if denyReason := s.identityAdmission.proof(pkt, addr, meta, now); denyReason != 0 {
+				s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktIdentityDeny, []byte{denyReason})
+			} else if existingPeer {
+				admission, found := s.identityAdmission.takeVerifiedAdmission(pkt, addr, meta, now)
+				if !found || !s.setPeerIdentityAdmission(pkt.Header.ChannelId, pkt.Header.SenderId, addr, admission) {
+					s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktIdentityDeny, []byte{identityDenyInvalidProof})
+				}
+			}
+		}
+		return
+	}
+	if (pkt.Header.Type == pktServiceBegin || pkt.Header.Type == pktServiceProof) && s.serviceAdmission != nil {
+		if !requiresAuth {
+			return
+		}
+		meta, ok := s.verifyIncomingControl(pkt)
+		if !ok {
+			return
+		}
+		existingPeer := s.isAuthenticatedPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
+		if existingPeer {
+			if !s.acceptAuthenticatedPeerControl(pkt, addr, meta) {
+				return
+			}
+		} else if !s.controlAuth.acceptPreJoinControl(pkt, addr, meta) {
+			return
+		}
+		now := time.Now()
+		switch pkt.Header.Type {
+		case pktServiceBegin:
+			challenge, denyReason := s.serviceAdmission.begin(pkt, addr, meta, now)
+			if denyReason != 0 {
+				s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktServiceDeny, []byte{denyReason})
+				return
+			}
+			s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktServiceChallenge, challenge)
+		case pktServiceProof:
+			if denyReason := s.serviceAdmission.proof(pkt, addr, meta, now); denyReason != 0 {
+				s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktServiceDeny, []byte{denyReason})
+			} else if existingPeer {
+				if s.peerHasIdentityAdmission(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+					// Consume the completed proof so it cannot be reused after this
+					// endpoint's existing identity-authorized membership ends.
+					_, _ = s.serviceAdmission.takeVerifiedAdmission(pkt, addr, meta, now)
+					s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktServiceDeny, []byte{serviceDenyScopeMismatch})
+					return
+				}
+				admission, found := s.serviceAdmission.takeVerifiedAdmission(pkt, addr, meta, now)
+				if !found || !s.setPeerServiceAdmission(pkt.Header.ChannelId, pkt.Header.SenderId, addr, admission) {
+					s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktServiceDeny, []byte{serviceDenyInvalidProof})
+				}
+			}
+		}
+		return
+	}
 
 	if pkt.Header.Type == pktJoin && requiresAuth {
 		meta, ok := s.verifyIncomingControl(pkt)
@@ -334,7 +443,18 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		if !ok {
 			return
 		}
+		identity, service, admitted, denyPacketType, denyReason := s.resolveJoinAdmission(pkt, addr, meta, time.Now())
+		if !admitted {
+			s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, denyPacketType, []byte{denyReason})
+			return
+		}
 		s.upsertAuthenticatedPeerWithReplay(pkt.Header.ChannelId, pkt.Header.SenderId, addr, meta, replay)
+		if !identity.expiresAt.IsZero() && !s.setPeerIdentityAdmission(pkt.Header.ChannelId, pkt.Header.SenderId, addr, identity) {
+			return
+		}
+		if !service.grantExpires.IsZero() && !s.setPeerServiceAdmission(pkt.Header.ChannelId, pkt.Header.SenderId, addr, service) {
+			return
+		}
 		if !s.startMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
 			return
 		}
@@ -367,12 +487,14 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 				releasedTalkerID,
 				s.talkMax)
 			s.broadcastRelayControl(pkt.Header.ChannelId, pktTalkRelease, releasedTalkerID, talkReleasePayload(releasedTalkerID, talkReleaseServerTimeout))
+			s.publishManagementEvent("talk_ended", uint32Pointer(pkt.Header.ChannelId), uint32Pointer(releasedTalkerID), nil, nil, nil, stringPointer("SERVER_TALK_TIMEOUT"))
 		}
 	}
 
 	switch pkt.Header.Type {
 	case pktJoin:
 		log.Printf("join ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
+		s.publishManagementEvent("participant_joined", uint32Pointer(pkt.Header.ChannelId), uint32Pointer(pkt.Header.SenderId), nil, nil, nil, nil)
 		s.sendServerConfig(pkt.Header.ChannelId, pkt.Header.SenderId)
 		s.sendCurrentTalkState(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktLeave:
@@ -382,6 +504,7 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		log.Printf("leave ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.releaseTalkIfNeeded(pkt.Header.ChannelId, pkt.Header.SenderId, talkReleaseClientLeave)
 		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
+		s.publishManagementEvent("participant_left", uint32Pointer(pkt.Header.ChannelId), uint32Pointer(pkt.Header.SenderId), nil, nil, nil, stringPointer("CLIENT_LEAVE"))
 	case pktKeepalive:
 		if len(pkt.Payload) != 0 {
 			return
@@ -391,9 +514,17 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		if len(pkt.Payload) != 0 {
 			return
 		}
+		if !s.peerAllowsTalk(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+			return
+		}
 		log.Printf("ptt_on ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
 		s.refreshMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
 		s.handlePttOn(pkt.Header.ChannelId, pkt.Header.SenderId)
+	case pktPttRequest:
+		if len(pkt.Payload) != 1 || pkt.Payload[0] != 0x01 || !s.handlePttRequest(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+			return
+		}
+		s.refreshMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
 	case pktPttOff:
 		if len(pkt.Payload) != 0 {
 			return
@@ -420,6 +551,9 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 
 func (s *server) handleMediaPacket(pkt parsedPacket, addr *net.UDPAddr) {
 	if !s.isActiveTalkerEndpoint(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+		return
+	}
+	if !s.peerAllowsTalk(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
 		return
 	}
 	if pkt.Header.Flags&packetFlagAESGCMV2HeaderAAD != 0 &&
@@ -742,6 +876,214 @@ func (s *server) isTalker(channelId uint32, senderId uint32) bool {
 	return ok
 }
 
+// resolveJoinAdmission consumes any completed admission flow for this endpoint
+// and enforces the required-mode rule that exactly one current identity or
+// service admission authorizes a managed endpoint.
+func (s *server) resolveJoinAdmission(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta, now time.Time) (identityAdmission, serviceAdmission, bool, uint8, uint8) {
+	identity, identityAllowed, identityReason := s.identityAdmission.admissionForJoin(pkt, addr, meta, now)
+	service, serviceAllowed, serviceReason := s.serviceAdmission.admissionForJoin(pkt, addr, meta, now)
+	if !serviceAllowed {
+		return identityAdmission{}, serviceAdmission{}, false, pktServiceDeny, serviceReason
+	}
+	serviceCurrent := !service.grantExpires.IsZero()
+	if !identityAllowed && !(identityReason == identityDenyAdmissionRequired && serviceCurrent) {
+		return identityAdmission{}, serviceAdmission{}, false, pktIdentityDeny, identityReason
+	}
+	identityCurrent := !identity.expiresAt.IsZero()
+	if identityCurrent && serviceCurrent {
+		// A peer must use one admission path per membership. This avoids an
+		// ambiguous authority/expiry domain when both flows complete pre-JOIN.
+		return identityAdmission{}, serviceAdmission{}, false, pktIdentityDeny, identityDenyScopeMismatch
+	}
+	if s.identityAdmission != nil && s.identityAdmission.isRequired() && !identityCurrent && !serviceCurrent {
+		return identityAdmission{}, serviceAdmission{}, false, pktIdentityDeny, identityDenyAdmissionRequired
+	}
+	return identity, service, true, 0, 0
+}
+
+func (s *server) peerAllowsTalk(channelId uint32, senderId uint32, addr *net.UDPAddr) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelId]
+	if ch == nil || addr == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	if peer == nil || peer.senderId != senderId {
+		return false
+	}
+	required := s.identityAdmission != nil && s.identityAdmission.isRequired()
+	if peer.identityAdmission != nil {
+		return admissionAllowsTalk(peer.identityAdmission, now, required)
+	}
+	if peer.serviceAdmission != nil {
+		return peer.serviceAdmission.membershipCurrent(now) && peer.serviceAdmission.permissions&identityPermissionTalk != 0
+	}
+	return !required
+}
+
+func (s *server) peerHasIdentityAdmission(channelID uint32, senderID uint32, addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelID]
+	if ch == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	return peer != nil && peer.senderId == senderID && peer.identityAdmission != nil
+}
+
+func activeTalkerPriority(ch *channel, senderId uint32, now time.Time) uint8 {
+	if ch == nil {
+		return 0
+	}
+	for _, peer := range ch.peers {
+		if peer == nil || peer.senderId != senderId {
+			continue
+		}
+		if peer.identityAdmission != nil && peer.identityAdmission.expiresAt.After(now) {
+			return peer.identityAdmission.priority
+		}
+		if peer.serviceAdmission != nil && peer.serviceAdmission.membershipCurrent(now) {
+			return peer.serviceAdmission.priority
+		}
+	}
+	return 0
+}
+
+func peerAllowsInterrupt(peer *peer, now time.Time) bool {
+	if peer == nil {
+		return false
+	}
+	if peer.identityAdmission != nil {
+		return admissionAllowsInterrupt(peer.identityAdmission, now)
+	}
+	if peer.serviceAdmission != nil {
+		return peer.serviceAdmission.membershipCurrent(now) &&
+			peer.serviceAdmission.permissions&identityPermissionTalk != 0 &&
+			peer.serviceAdmission.permissions&identityPermissionInterrupt != 0 && peer.serviceAdmission.priority != 0
+	}
+	return false
+}
+
+func peerInterruptPriority(peer *peer, now time.Time) uint8 {
+	if !peerAllowsInterrupt(peer, now) {
+		return 0
+	}
+	if peer.identityAdmission != nil {
+		return peer.identityAdmission.priority
+	}
+	return peer.serviceAdmission.priority
+}
+
+func peerAdmissionPriority(peer *peer, now time.Time) uint8 {
+	if peer == nil {
+		return 0
+	}
+	if peer.identityAdmission != nil && peer.identityAdmission.expiresAt.After(now) {
+		return peer.identityAdmission.priority
+	}
+	if peer.serviceAdmission != nil && peer.serviceAdmission.membershipCurrent(now) {
+		return peer.serviceAdmission.priority
+	}
+	return 0
+}
+
+// denyPttRequest deliberately uses the ordinary TALK_DENY shape without
+// exposing whether policy, authorization, or current floor state caused it.
+func (s *server) denyPttRequest(channelId uint32, senderId uint32) {
+	s.mu.Lock()
+	ch := s.channels[channelId]
+	current := firstActiveTalker(ch)
+	s.mu.Unlock()
+	s.sendRelayControlTo(channelId, senderId, pktTalkDeny, current, talkPayload(current))
+}
+
+// handlePttRequest applies the Floor Interrupt selection algorithm. Its return
+// value means that the authenticated request was authorized and therefore may
+// refresh the requester's membership even when the floor decision is a deny.
+func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.UDPAddr) bool {
+	if !s.floorInterrupt || s.identityAdmission == nil || !s.identityAdmission.isRequired() || !s.controlAuthRequired(channelId) {
+		s.denyPttRequest(channelId, senderId)
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	ch := s.channels[channelId]
+	if ch == nil || addr == nil {
+		s.mu.Unlock()
+		s.denyPttRequest(channelId, senderId)
+		return false
+	}
+	requester := ch.peers[peerMapKey(addr)]
+	if requester == nil || requester.senderId != senderId || requester.membershipDeadline.IsZero() || !requester.membershipDeadline.After(now) ||
+		!peerAllowsInterrupt(requester, now) {
+		priority := peerAdmissionPriority(requester, now)
+		s.mu.Unlock()
+		s.auditFloorInterrupt(channelId, requester, priority, "denied", nil, nil)
+		s.denyPttRequest(channelId, senderId)
+		return false
+	}
+	if _, active := ch.activeTalkers[senderId]; active {
+		priority := peerInterruptPriority(requester, now)
+		s.mu.Unlock()
+		s.auditFloorInterrupt(channelId, requester, priority, "success", nil, nil)
+		s.sendRelayControlTo(channelId, senderId, pktTalkGrant, senderId, talkPayload(senderId))
+		return true
+	}
+
+	limit := 1
+	if s.multiTalk {
+		limit = s.maxActiveTalkers
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if len(ch.activeTalkers) < limit {
+		ch.activeTalkers[senderId] = now
+		priority := peerInterruptPriority(requester, now)
+		s.mu.Unlock()
+		s.auditFloorInterrupt(channelId, requester, priority, "success", nil, nil)
+		s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
+		s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
+		return true
+	}
+
+	var victim uint32
+	victimPriority := uint8(0xff)
+	for activeSenderID := range ch.activeTalkers {
+		priority := activeTalkerPriority(ch, activeSenderID, now)
+		if victim == 0 || priority < victimPriority || (priority == victimPriority && activeSenderID < victim) {
+			victim = activeSenderID
+			victimPriority = priority
+		}
+	}
+	requesterPriority := peerInterruptPriority(requester, now)
+	if victim == 0 || requesterPriority <= victimPriority {
+		current := firstActiveTalker(ch)
+		s.mu.Unlock()
+		s.auditFloorInterrupt(channelId, requester, requesterPriority, "denied", nil, nil)
+		s.sendRelayControlTo(channelId, senderId, pktTalkDeny, current, talkPayload(current))
+		return true
+	}
+	delete(ch.activeTalkers, victim)
+	ch.activeTalkers[senderId] = now
+	s.mu.Unlock()
+
+	// Release is sent first to minimize the time a replacement overlaps queued
+	// old media. Receivers still must tolerate UDP reordering.
+	s.broadcastRelayControl(channelId, pktTalkRelease, victim, talkReleasePayload(victim, talkReleasePreempted))
+	s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
+	s.auditFloorInterrupt(channelId, requester, requesterPriority, "success", uint32Pointer(victim), uint8Pointer(victimPriority))
+	s.publishManagementEvent("talk_ended", uint32Pointer(channelId), uint32Pointer(victim), nil, nil, nil, stringPointer("PREEMPTED"))
+	s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
+	return true
+}
+
 func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 	s.mu.Lock()
 	ch := s.channels[channelId]
@@ -774,6 +1116,7 @@ func (s *server) handlePttOn(channelId uint32, senderId uint32) {
 		s.mu.Unlock()
 		log.Printf("talk_grant ch=%d talker=%d active=%d/%d multi=%t", channelId, senderId, activeCount, limit, s.multiTalk)
 		s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
+		s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
 		return
 	}
 
@@ -801,6 +1144,7 @@ func (s *server) handlePttOff(channelId uint32, senderId uint32) {
 	s.mu.Unlock()
 	log.Printf("talk_release ch=%d talker=%d", channelId, senderId)
 	s.broadcastRelayControl(channelId, pktTalkRelease, senderId, talkReleasePayload(senderId, talkReleaseClientPttOff))
+	s.publishManagementEvent("talk_ended", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, stringPointer("CLIENT_PTT_OFF"))
 }
 
 func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32, reason uint8) {
@@ -820,6 +1164,7 @@ func (s *server) releaseTalkIfNeeded(channelId uint32, senderId uint32, reason u
 	s.mu.Unlock()
 	log.Printf("talk_release ch=%d talker=%d reason=%d (peer_left)", channelId, senderId, reason)
 	s.broadcastRelayControl(channelId, pktTalkRelease, senderId, talkReleasePayload(senderId, reason))
+	s.publishManagementEvent("talk_ended", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, stringPointer(talkReleaseReasonName(reason)))
 }
 
 func (s *server) expireTalkIfNeeded(channelId uint32) []uint32 {
@@ -852,7 +1197,32 @@ func (s *server) expireTalkIfNeeded(channelId uint32) []uint32 {
 	return released
 }
 
-func (s *server) expireMembershipIfNeeded(channelId uint32) []uint32 {
+type membershipExpiry struct {
+	senderId uint32
+	reason   uint8
+	active   bool
+}
+
+func membershipExpired(peer *peer, now time.Time) (uint8, bool) {
+	if peer == nil {
+		return 0, false
+	}
+	normalExpired := !peer.membershipDeadline.IsZero() && !peer.membershipDeadline.After(now)
+	identityExpired := peer.identityAdmission != nil && !peer.identityAdmission.expiresAt.After(now)
+	serviceExpired := peer.serviceAdmission != nil && !peer.serviceAdmission.expiryDeadline().After(now)
+	if !normalExpired && !identityExpired && !serviceExpired {
+		return 0, false
+	}
+	if identityExpired && (!normalExpired || peer.membershipDeadline.IsZero() || peer.identityAdmission.expiresAt.Before(peer.membershipDeadline)) {
+		return talkReleaseIdentityExpired, true
+	}
+	if serviceExpired && (!normalExpired || peer.membershipDeadline.IsZero() || peer.serviceAdmission.expiryDeadline().Before(peer.membershipDeadline)) {
+		return talkReleaseServiceExpired, true
+	}
+	return talkReleaseMembershipTimeout, true
+}
+
+func (s *server) expireMembershipIfNeeded(channelId uint32) []membershipExpiry {
 	now := time.Now()
 	s.mu.Lock()
 	ch := s.channels[channelId]
@@ -860,31 +1230,37 @@ func (s *server) expireMembershipIfNeeded(channelId uint32) []uint32 {
 		s.mu.Unlock()
 		return nil
 	}
-	released := make([]uint32, 0)
+	released := make([]membershipExpiry, 0)
 	for key, peer := range ch.peers {
-		if peer.membershipDeadline.IsZero() || peer.membershipDeadline.After(now) {
+		reason, expired := membershipExpired(peer, now)
+		if !expired {
 			continue
 		}
 		delete(ch.peers, key)
 		delete(ch.codecConfigs, peer.senderId)
 		delete(ch.mediaCodecConfigs, peer.senderId)
-		if _, active := ch.activeTalkers[peer.senderId]; active {
+		active := false
+		if _, active = ch.activeTalkers[peer.senderId]; active {
 			delete(ch.activeTalkers, peer.senderId)
-			released = append(released, peer.senderId)
 		}
+		released = append(released, membershipExpiry{senderId: peer.senderId, reason: reason, active: active})
 	}
 	if len(ch.peers) == 0 {
 		delete(s.channels, channelId)
 	}
 	s.mu.Unlock()
-	sort.Slice(released, func(i, j int) bool { return released[i] < released[j] })
+	sort.Slice(released, func(i, j int) bool { return released[i].senderId < released[j].senderId })
 	return released
 }
 
 func (s *server) emitMembershipExpirations(channelId uint32) {
-	for _, senderId := range s.expireMembershipIfNeeded(channelId) {
-		log.Printf("talk_release ch=%d talker=%d reason=%d (membership_timeout)", channelId, senderId, talkReleaseMembershipTimeout)
-		s.broadcastRelayControl(channelId, pktTalkRelease, senderId, talkReleasePayload(senderId, talkReleaseMembershipTimeout))
+	for _, expiry := range s.expireMembershipIfNeeded(channelId) {
+		if expiry.active {
+			log.Printf("talk_release ch=%d talker=%d reason=%d (membership_expiry)", channelId, expiry.senderId, expiry.reason)
+			s.broadcastRelayControl(channelId, pktTalkRelease, expiry.senderId, talkReleasePayload(expiry.senderId, expiry.reason))
+			s.publishManagementEvent("talk_ended", uint32Pointer(channelId), uint32Pointer(expiry.senderId), nil, nil, nil, stringPointer(talkReleaseReasonName(expiry.reason)))
+		}
+		s.publishManagementEvent("participant_left", uint32Pointer(channelId), uint32Pointer(expiry.senderId), nil, nil, nil, stringPointer(talkReleaseReasonName(expiry.reason)))
 	}
 }
 
@@ -1048,19 +1424,26 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 			talkerID  uint32
 			reason    uint8
 		}
+		type departureEvent struct {
+			channelID uint32
+			senderID  uint32
+			reason    uint8
+		}
 		releases := make([]releaseEvent, 0)
+		departures := make([]departureEvent, 0)
 
 		s.mu.Lock()
 		for channelId, ch := range s.channels {
 			releaseReasons := make(map[uint32]uint8)
 			for key, p := range ch.peers {
-				if !p.membershipDeadline.IsZero() && !p.membershipDeadline.After(now) {
+				if reason, expired := membershipExpired(p, now); expired {
 					delete(ch.peers, key)
 					delete(ch.codecConfigs, p.senderId)
 					delete(ch.mediaCodecConfigs, p.senderId)
+					departures = append(departures, departureEvent{channelID: channelId, senderID: p.senderId, reason: reason})
 					if _, ok := ch.activeTalkers[p.senderId]; ok {
 						delete(ch.activeTalkers, p.senderId)
-						releaseReasons[p.senderId] = talkReleaseMembershipTimeout
+						releaseReasons[p.senderId] = reason
 					}
 				}
 			}
@@ -1097,6 +1480,16 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 		for _, release := range releases {
 			log.Printf("talk_release ch=%d talker=%d reason=%d (cleanup)", release.channelID, release.talkerID, release.reason)
 			s.broadcastRelayControl(release.channelID, pktTalkRelease, release.talkerID, talkReleasePayload(release.talkerID, release.reason))
+			s.publishManagementEvent("talk_ended", uint32Pointer(release.channelID), uint32Pointer(release.talkerID), nil, nil, nil, stringPointer(talkReleaseReasonName(release.reason)))
+		}
+		sort.Slice(departures, func(i, j int) bool {
+			if departures[i].channelID != departures[j].channelID {
+				return departures[i].channelID < departures[j].channelID
+			}
+			return departures[i].senderID < departures[j].senderID
+		})
+		for _, departure := range departures {
+			s.publishManagementEvent("participant_left", uint32Pointer(departure.channelID), uint32Pointer(departure.senderID), nil, nil, nil, stringPointer(talkReleaseReasonName(departure.reason)))
 		}
 	}
 }
@@ -1209,6 +1602,8 @@ func pktTypeName(t uint8) string {
 		return "ptt_on"
 	case pktPttOff:
 		return "ptt_off"
+	case pktPttRequest:
+		return "ptt_request"
 	case pktKeepalive:
 		return "keepalive"
 	case pktJoin:
@@ -1229,6 +1624,26 @@ func pktTypeName(t uint8) string {
 		return "fec"
 	case pktServerCfg:
 		return "server_config"
+	case pktAuthHello:
+		return "auth_hello"
+	case pktAuthChallenge:
+		return "auth_challenge"
+	case pktIdentityBegin:
+		return "identity_begin"
+	case pktIdentityChallenge:
+		return "identity_challenge"
+	case pktIdentityProof:
+		return "identity_proof"
+	case pktIdentityDeny:
+		return "identity_deny"
+	case pktServiceBegin:
+		return "service_admission_begin"
+	case pktServiceChallenge:
+		return "service_admission_challenge"
+	case pktServiceProof:
+		return "service_admission_proof"
+	case pktServiceDeny:
+		return "service_admission_deny"
 	default:
 		return "unknown"
 	}
@@ -1343,6 +1758,31 @@ func talkReleasePayload(talkerId uint32, reason uint8) []byte {
 	return payload
 }
 
+func talkReleaseReasonName(reason uint8) string {
+	switch reason {
+	case talkReleaseClientPttOff:
+		return "CLIENT_PTT_OFF"
+	case talkReleaseServerTimeout:
+		return "SERVER_TALK_TIMEOUT"
+	case talkReleaseMembershipTimeout:
+		return "MEMBERSHIP_TIMEOUT"
+	case talkReleaseClientLeave:
+		return "CLIENT_LEAVE"
+	case talkReleaseServerPolicy:
+		return "SERVER_POLICY"
+	case talkReleaseIdentityExpired:
+		return "IDENTITY_EXPIRED"
+	case talkReleaseServiceRevoked:
+		return "SERVICE_ADMISSION_REVOKED"
+	case talkReleasePreempted:
+		return "PREEMPTED"
+	case talkReleaseServiceExpired:
+		return "SERVICE_ADMISSION_EXPIRED"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 func main() {
 	port := flag.Int("port", 50000, "UDP listen port")
 	membershipLeaseDefault := int(defaultMembershipLease / time.Second)
@@ -1431,6 +1871,48 @@ func main() {
 	controlAuthPolicyFlag := flag.String("control-auth-policy", controlAuthPolicyDefault, "control authentication policy: off, optional, or required")
 	controlKeyFile := flag.String("control-key-file", os.Getenv("INCOMUDON_CONTROL_KEY_FILE"), "CSV file containing channel_id,key_id,control_key_base64")
 	controlCookieSecretFile := flag.String("control-cookie-secret-file", os.Getenv("INCOMUDON_CONTROL_COOKIE_SECRET_FILE"), "file containing the Relay control cookie secret")
+	identityAdmissionModeDefault := os.Getenv("INCOMUDON_IDENTITY_ADMISSION_MODE")
+	if identityAdmissionModeDefault == "" {
+		identityAdmissionModeDefault = string(identityAdmissionOff)
+	}
+	identityAdmissionModeFlag := flag.String("identity-admission-mode", identityAdmissionModeDefault, "identity admission policy: off, optional, or required")
+	identityIssuer := flag.String("identity-issuer", os.Getenv("INCOMUDON_IDENTITY_ISSUER"), "expected Identity Admission ticket issuer")
+	identityAudience := flag.String("identity-audience", os.Getenv("INCOMUDON_IDENTITY_AUDIENCE"), "expected Identity Admission ticket audience")
+	identitySigningKeyFile := flag.String("identity-signing-key-file", os.Getenv("INCOMUDON_IDENTITY_SIGNING_KEY_FILE"), "CSV file containing kid,ed25519_public_key_base64")
+	serviceAdmissionModeDefault := os.Getenv("INCOMUDON_SERVICE_ADMISSION_MODE")
+	if serviceAdmissionModeDefault == "" {
+		serviceAdmissionModeDefault = string(serviceAdmissionOff)
+	}
+	serviceAdmissionModeFlag := flag.String("service-admission-mode", serviceAdmissionModeDefault, "managed service admission policy: off or enabled")
+	serviceAdmissionIssuer := flag.String("service-admission-issuer", os.Getenv("INCOMUDON_SERVICE_ADMISSION_ISSUER"), "expected Managed Service Admission grant issuer")
+	serviceAdmissionAudience := flag.String("service-admission-audience", os.Getenv("INCOMUDON_SERVICE_ADMISSION_AUDIENCE"), "expected Managed Service Admission grant audience")
+	serviceAdmissionSigningKeyFile := flag.String("service-admission-signing-key-file", os.Getenv("INCOMUDON_SERVICE_ADMISSION_SIGNING_KEY_FILE"), "CSV file containing kid,ed25519_public_key_base64")
+	managementEnabledDefault := false
+	if raw := os.Getenv("INCOMUDON_MANAGEMENT_ENABLED"); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			managementEnabledDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_MANAGEMENT_ENABLED=%q (using false)", raw)
+		}
+	}
+	managementEnabled := flag.Bool("management-enabled", managementEnabledDefault, "enable the mTLS-protected Management Plane v1 listener")
+	managementListen := flag.String("management-listen", os.Getenv("INCOMUDON_MANAGEMENT_LISTEN"), "Management Plane HTTPS listen address")
+	managementCertificateFile := flag.String("management-cert-file", os.Getenv("INCOMUDON_MANAGEMENT_CERT_FILE"), "Management Plane server certificate PEM file")
+	managementPrivateKeyFile := flag.String("management-key-file", os.Getenv("INCOMUDON_MANAGEMENT_KEY_FILE"), "Management Plane server private key PEM file")
+	managementClientCAFile := flag.String("management-client-ca-file", os.Getenv("INCOMUDON_MANAGEMENT_CLIENT_CA_FILE"), "Management Plane trusted client CA PEM file")
+	managementServicesCSV := flag.String("management-services-csv", os.Getenv("INCOMUDON_MANAGEMENT_SERVICES_CSV"), "Management Plane services CSV")
+	managementChannelACLCSV := flag.String("management-channel-acl-csv", os.Getenv("INCOMUDON_MANAGEMENT_CHANNEL_ACL_CSV"), "Management Plane channel ACL CSV")
+	managementGlobalPermissionsCSV := flag.String("management-global-permissions-csv", os.Getenv("INCOMUDON_MANAGEMENT_GLOBAL_PERMISSIONS_CSV"), "Management Plane explicit global permissions CSV")
+	managementSigningKeyFile := flag.String("management-signing-key-file", os.Getenv("INCOMUDON_MANAGEMENT_SIGNING_KEY_FILE"), "Management Plane Ed25519 private signing key CSV")
+	floorInterruptDefault := false
+	if raw := os.Getenv("INCOMUDON_FLOOR_INTERRUPT_ENABLED"); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			floorInterruptDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_FLOOR_INTERRUPT_ENABLED=%q (using false)", raw)
+		}
+	}
+	floorInterrupt := flag.Bool("floor-interrupt", floorInterruptDefault, "enable Identity Admission-authorized Floor Interrupt v1")
 	noCrypto := flag.Bool("no-crypto", false, "accept/send packets without security header/tag")
 	logPackets := flag.Bool("log-packets", false, "log received packets")
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
@@ -1483,6 +1965,45 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid control authentication configuration: %v", err)
 	}
+	identityMode, err := parseIdentityAdmissionMode(*identityAdmissionModeFlag)
+	if err != nil {
+		log.Fatalf("invalid identity admission policy: %v", err)
+	}
+	identityKeys := make(identitySigningKeyStore)
+	if identityMode != identityAdmissionOff {
+		identityKeys, err = loadIdentitySigningKeys(*identitySigningKeyFile)
+		if err != nil {
+			log.Fatalf("invalid identity signing key configuration: %v", err)
+		}
+	}
+	if identityMode == identityAdmissionRequired && controlPolicy != controlAuthRequired {
+		log.Fatal("identity admission required requires control-auth-policy=required")
+	}
+	identityAdmission, err := newIdentityAdmissionState(identityMode, *identityIssuer, *identityAudience, identityKeys)
+	if err != nil {
+		log.Fatalf("invalid identity admission configuration: %v", err)
+	}
+	if *floorInterrupt && (identityAdmission == nil || !identityAdmission.isRequired() || controlPolicy != controlAuthRequired) {
+		log.Fatal("floor-interrupt requires identity-admission-mode=required and control-auth-policy=required")
+	}
+	serviceMode, err := parseServiceAdmissionMode(*serviceAdmissionModeFlag)
+	if err != nil {
+		log.Fatalf("invalid managed service admission policy: %v", err)
+	}
+	serviceKeys := make(serviceSigningKeyStore)
+	if serviceMode != serviceAdmissionOff {
+		if controlPolicy == controlAuthOff || len(controlKeys) == 0 {
+			log.Fatal("managed service admission requires configured Control Authentication keys")
+		}
+		serviceKeys, err = loadServiceSigningKeys(*serviceAdmissionSigningKeyFile)
+		if err != nil {
+			log.Fatalf("invalid managed service signing key configuration: %v", err)
+		}
+	}
+	serviceAdmission, err := newServiceAdmissionState(serviceMode, *serviceAdmissionIssuer, *serviceAdmissionAudience, serviceKeys)
+	if err != nil {
+		log.Fatalf("invalid managed service admission configuration: %v", err)
+	}
 
 	addr := &net.UDPAddr{Port: *port}
 	conn, err := net.ListenUDP("udp", addr)
@@ -1495,6 +2016,19 @@ func main() {
 		log.Fatalf("invalid membership timing: %v", err)
 	}
 	srv.configureControlAuth(controlAuth)
+	srv.configureIdentityAdmission(identityAdmission, *floorInterrupt)
+	srv.configureServiceAdmission(serviceAdmission)
+	if *managementEnabled {
+		if _, err := startManagementPlane(srv, managementPlaneConfig{
+			listenAddress: *managementListen, certificateFile: *managementCertificateFile, privateKeyFile: *managementPrivateKeyFile,
+			clientCAFile: *managementClientCAFile, servicesCSV: *managementServicesCSV, channelACLCSV: *managementChannelACLCSV,
+			globalPermissionsCSV: *managementGlobalPermissionsCSV, signingKeyFile: *managementSigningKeyFile,
+			issuer: *serviceAdmissionIssuer, audience: *serviceAdmissionAudience,
+		}); err != nil {
+			log.Fatalf("invalid Management Plane configuration: %v", err)
+		}
+		log.Printf("Management Plane HTTPS listener enabled at %s", *managementListen)
+	}
 
 	directoryPublisher, err := newDirectoryPublisher(directoryPublisherConfig{
 		Enabled:           *directoryEnabled,
@@ -1531,7 +2065,7 @@ func main() {
 	if *noCrypto {
 		mode = "no-crypto"
 	}
-	log.Printf("IncomUdon relay listening on udp :%d (%s, control_auth=%s, talk_max=%ds, membership_lease=%ds, keepalive_interval=%ds, multi_talk=%t, max_active_talkers=%d)", *port, mode, controlPolicy, *talkMaxSec, *membershipLeaseSec, *keepaliveIntervalSec, *multiTalk, *maxActiveTalkers)
+	log.Printf("IncomUdon relay listening on udp :%d (%s, control_auth=%s, identity_admission=%s, service_admission=%s, floor_interrupt=%t, talk_max=%ds, membership_lease=%ds, keepalive_interval=%ds, multi_talk=%t, max_active_talkers=%d)", *port, mode, controlPolicy, identityMode, serviceMode, *floorInterrupt, *talkMaxSec, *membershipLeaseSec, *keepaliveIntervalSec, *multiTalk, *maxActiveTalkers)
 
 	if *logAudio {
 		*logPackets = true

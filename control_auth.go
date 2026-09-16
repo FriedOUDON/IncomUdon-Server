@@ -508,6 +508,44 @@ func (s *server) upsertAuthenticatedPeerWithReplay(channelID uint32, senderID ui
 	p.controlSeenWindow = replay.seen
 }
 
+func (s *server) setPeerIdentityAdmission(channelID uint32, senderID uint32, addr *net.UDPAddr, admission identityAdmission) bool {
+	if addr == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelID]
+	if ch == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	if peer == nil || peer.senderId != senderID || peer.serviceAdmission != nil {
+		return false
+	}
+	copy := admission
+	peer.identityAdmission = &copy
+	return true
+}
+
+func (s *server) setPeerServiceAdmission(channelID uint32, senderID uint32, addr *net.UDPAddr, admission serviceAdmission) bool {
+	if addr == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelID]
+	if ch == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	if peer == nil || peer.senderId != senderID || peer.identityAdmission != nil {
+		return false
+	}
+	copy := admission
+	peer.serviceAdmission = &copy
+	return true
+}
+
 func (s *server) acceptAuthenticatedPeerControl(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -578,6 +616,10 @@ func (s *server) mediaMatchesCodecConfig(pkt parsedPacket) bool {
 }
 
 func (s *server) sendAuthenticatedChallenge(addr *net.UDPAddr, channelID uint32, senderID uint32, keyID uint32, payload []byte) {
+	s.sendAuthenticatedControl(addr, channelID, senderID, keyID, pktAuthChallenge, payload)
+}
+
+func (s *server) sendAuthenticatedControl(addr *net.UDPAddr, channelID uint32, senderID uint32, keyID uint32, packetType uint8, payload []byte) {
 	if s.controlAuth == nil || addr == nil {
 		return
 	}
@@ -589,9 +631,9 @@ func (s *server) sendAuthenticatedChallenge(addr *net.UDPAddr, channelID uint32,
 	if !ok {
 		return
 	}
-	packet := buildAuthenticatedControlPacketWithSeq(pktAuthChallenge, channelID, senderID, payload, keyID, key, nonce, s.nextRelaySequence())
+	packet := buildAuthenticatedControlPacketWithSeq(packetType, channelID, senderID, payload, keyID, key, nonce, s.nextRelaySequence())
 	if _, err := s.conn.WriteToUDP(packet, addr); err != nil {
-		log.Printf("auth_challenge send failed ch=%d sender=%d: %v", channelID, senderID, err)
+		log.Printf("authenticated control send failed type=%s ch=%d sender=%d: %v", pktTypeName(packetType), channelID, senderID, err)
 	}
 }
 
