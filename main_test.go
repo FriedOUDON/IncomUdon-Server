@@ -114,7 +114,7 @@ func TestServerConfigUsesEffectiveTalkerLimit(t *testing.T) {
 	const channelID uint32 = 47
 	const listenerID uint32 = 7001
 
-	s := newServer(relay, true, false, false, 0, false, maxActiveTalkersV1)
+	s := newServer(relay, true, false, false, 60*time.Second, false, maxActiveTalkersV1)
 	s.channels[channelID] = &channel{
 		peers: map[string]*peer{
 			"listener": {addr: listener.LocalAddr().(*net.UDPAddr), senderId: listenerID},
@@ -124,16 +124,62 @@ func TestServerConfigUsesEffectiveTalkerLimit(t *testing.T) {
 	}
 	s.sendServerConfig(channelID, listenerID)
 	packet := receiveTestPacket(t, listener)
-	if packet.Header.Type != pktServerCfg || len(packet.Payload) != 4 {
+	if packet.Header.Type != pktServerCfg || len(packet.Payload) != 8 {
 		t.Fatalf("unexpected server config packet: type=%d payload=%v", packet.Header.Type, packet.Payload)
+	}
+	if got, want := hex.EncodeToString(packet.Payload), "003c0001001e000a"; got != want {
+		t.Fatalf("SERVER_CONFIG payload = %s, want %s", got, want)
 	}
 	if got := packet.Payload[3]; got != 1 {
 		t.Fatalf("single-talk server config limit = %d, want 1", got)
+	}
+	if got := binary.BigEndian.Uint16(packet.Payload[4:6]); got != 30 {
+		t.Fatalf("membership lease = %d, want 30", got)
+	}
+	if got := binary.BigEndian.Uint16(packet.Payload[6:8]); got != 10 {
+		t.Fatalf("keepalive interval = %d, want 10", got)
 	}
 
 	s = newServer(relay, true, false, false, 0, true, maxActiveTalkersV1+10)
 	if s.maxActiveTalkers != maxActiveTalkersV1 {
 		t.Fatalf("max active talkers = %d, want clamp %d", s.maxActiveTalkers, maxActiveTalkersV1)
+	}
+}
+
+func TestCodecConfigUsesU32BitrateAndRequiredAESGCMV2Policy(t *testing.T) {
+	const channelID uint32 = 48
+	state, key := newRequiredControlAuthState(t, channelID)
+	s := newServer(newTestUDPConn(t), false, false, false, 0, false, 1)
+	s.configureControlAuth(state)
+	s.channels[channelID] = &channel{
+		peers:             make(map[string]*peer),
+		activeTalkers:     make(map[uint32]time.Time),
+		codecConfigs:      make(map[uint32][]byte),
+		mediaCodecConfigs: make(map[uint32]codecConfigState),
+	}
+
+	valid := append([]byte{0, 2, 0, 1, 0xf4, 0x00, 0}, make([]byte, 12)...)
+	copy(valid[7:], []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
+	if pcmOnly, codecID, bitrate, ok := parseCodecConfigPayload(valid); !ok || pcmOnly || codecID != 2 || bitrate != 128000 {
+		t.Fatalf("CODEC_CONFIG parse = pcm=%t codec=%d bitrate=%d ok=%t", pcmOnly, codecID, bitrate, ok)
+	}
+	if _, ok := s.cacheCodecConfig(channelID, 9001, valid[:18], 1, true); ok {
+		t.Fatal("short CODEC_CONFIG was accepted")
+	}
+	zeroBase := append([]byte(nil), valid...)
+	clear(zeroBase[7:])
+	if _, ok := s.cacheCodecConfig(channelID, 9001, zeroBase, 1, true); ok {
+		t.Fatal("required policy accepted zero media nonce base")
+	}
+	if _, ok := s.cacheCodecConfig(channelID, 9001, valid, 1, false); ok {
+		t.Fatal("required policy accepted unauthenticated AES-GCM v2 config")
+	}
+	config, ok := s.cacheCodecConfig(channelID, 9001, valid, 1, true)
+	if !ok || config.controlKeyID != 1 || config.mediaKeyID != 2 {
+		t.Fatalf("authenticated AES-GCM v2 CODEC_CONFIG = %#v, ok=%t", config, ok)
+	}
+	if len(key) != 32 {
+		t.Fatal("test control key was not initialized")
 	}
 }
 
@@ -152,7 +198,7 @@ func TestJoinSyncSendsCodecConfigBeforeGrant(t *testing.T) {
 	const channelID uint32 = 42
 	const talkerID uint32 = 2001
 	const joinerID uint32 = 2002
-	codecConfig := []byte{0, 1, 0x06, 0x40}
+	codecConfig := []byte{0, 2, 0, 0, 0x2e, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 
 	s := newServer(relay, true, false, false, 0, true, 2)
 	s.channels[channelID] = &channel{
@@ -187,8 +233,8 @@ func TestFecRequiresActiveTalker(t *testing.T) {
 	s := newServer(relay, true, false, false, 0, true, 2)
 	s.channels[channelID] = &channel{
 		peers: map[string]*peer{
-			"sender":   {addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID},
-			"listener": {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 3002},
+			peerMapKey(sender.LocalAddr().(*net.UDPAddr)):   {addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID, membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute)},
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 3002, membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute)},
 		},
 		activeTalkers: make(map[uint32]time.Time),
 		codecConfigs:  make(map[uint32][]byte),
@@ -218,13 +264,17 @@ func TestForwardsAESGCMV2MediaPacketWithoutChangingAuthenticatedHeader(t *testin
 	const senderID uint32 = 4001
 
 	s := newServer(relay, false, false, false, 0, true, 2)
+	state, _ := newRequiredControlAuthState(t, channelID)
+	s.configureControlAuth(state)
+	mediaBase := [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
 	s.channels[channelID] = &channel{
 		peers: map[string]*peer{
-			"sender":   {addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID},
-			"listener": {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 4002},
+			peerMapKey(sender.LocalAddr().(*net.UDPAddr)):   {addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID, authenticated: true, controlSessionID: 1, controlKeyID: 1, membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute)},
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 4002, membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute)},
 		},
-		activeTalkers: map[uint32]time.Time{senderID: time.Now()},
-		codecConfigs:  make(map[uint32][]byte),
+		activeTalkers:     map[uint32]time.Time{senderID: time.Now()},
+		codecConfigs:      make(map[uint32][]byte),
+		mediaCodecConfigs: map[uint32]codecConfigState{senderID: {mediaNonceBase: mediaBase, mediaKeyID: 2}},
 	}
 
 	// The Relay does not decrypt media. It must preserve the v2 AAD bytes
@@ -236,7 +286,7 @@ func TestForwardsAESGCMV2MediaPacketWithoutChangingAuthenticatedHeader(t *testin
 	binary.BigEndian.PutUint32(raw[4:8], channelID)
 	binary.BigEndian.PutUint32(raw[8:12], senderID)
 	binary.BigEndian.PutUint16(raw[14:16], packetFlagAESGCMV2HeaderAAD)
-	copy(raw[16:28], []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
+	copy(raw[16:28], mediaBase[:])
 	binary.BigEndian.PutUint32(raw[28:32], 7)
 	binary.BigEndian.PutUint32(raw[32:36], 2)
 	copy(raw[aesGCMV2HeaderSize:], []byte{1, 2, 3})
@@ -253,6 +303,32 @@ func TestForwardsAESGCMV2MediaPacketWithoutChangingAuthenticatedHeader(t *testin
 	if string(forwarded.Raw) != string(raw) {
 		t.Fatal("Relay modified v2 media packet bytes")
 	}
+}
+
+func TestAESGCMV2MediaIsRejectedWithoutControlAuthentication(t *testing.T) {
+	relay := newTestUDPConn(t)
+	sender := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 441
+	const senderID uint32 = 4011
+
+	s := newServer(relay, false, false, false, 0, true, 2)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(sender.LocalAddr().(*net.UDPAddr)):   {addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID, membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute)},
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {addr: listener.LocalAddr().(*net.UDPAddr), senderId: 4012, membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute)},
+		},
+		activeTalkers: map[uint32]time.Time{senderID: time.Now()},
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	raw := buildAESGCMV2MediaPacket(pktAudio, channelID, senderID, [12]byte{1}, 1, []byte{1})
+	packet, ok := parsePacket(raw, false)
+	if !ok {
+		t.Fatal("failed to parse AES-GCM v2 media")
+	}
+	s.handlePacket(packet, sender.LocalAddr().(*net.UDPAddr))
+	expectNoTestPacket(t, listener)
 }
 
 func TestPingRepliesOnlyToRegisteredEndpoint(t *testing.T) {
@@ -288,6 +364,9 @@ func TestPingRepliesOnlyToRegisteredEndpoint(t *testing.T) {
 	}
 	if pong.Header.ChannelId != channelID || pong.Header.SenderId != requesterID {
 		t.Fatalf("unexpected pong header: channel=%d sender=%d", pong.Header.ChannelId, pong.Header.SenderId)
+	}
+	if pong.Header.Seq != 0 {
+		t.Fatalf("PONG Relay sequence = %d, want 0", pong.Header.Seq)
 	}
 	if string(pong.Payload) != string(nonce) {
 		t.Fatalf("pong nonce mismatch: got=%x want=%x", pong.Payload, nonce)
@@ -375,13 +454,13 @@ func TestControlAuthChallengeIsSourceBoundAndSingleUse(t *testing.T) {
 	}
 	joinMeta := controlAuthMeta{keyID: 1, sessionID: sessionID, counter: 1}
 	wrongAddr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 11), Port: 50001}
-	if state.consumeJoinChallenge(join, wrongAddr, joinMeta) {
+	if _, ok := state.consumeJoinChallenge(join, wrongAddr, joinMeta); ok {
 		t.Fatal("source-address mismatched cookie was accepted")
 	}
-	if !state.consumeJoinChallenge(join, addr, joinMeta) {
+	if _, ok := state.consumeJoinChallenge(join, addr, joinMeta); !ok {
 		t.Fatal("valid challenge cookie was rejected")
 	}
-	if state.consumeJoinChallenge(join, addr, joinMeta) {
+	if _, ok := state.consumeJoinChallenge(join, addr, joinMeta); ok {
 		t.Fatal("reused challenge cookie was accepted")
 	}
 
@@ -392,7 +471,7 @@ func TestControlAuthChallengeIsSourceBoundAndSingleUse(t *testing.T) {
 	if !ok {
 		t.Fatal("parse expired JOIN")
 	}
-	if state.consumeJoinChallenge(expiredJoin, addr, joinMeta) {
+	if _, ok := state.consumeJoinChallenge(expiredJoin, addr, joinMeta); ok {
 		t.Fatal("expired challenge cookie was accepted")
 	}
 }
@@ -503,10 +582,12 @@ func TestAuthenticatedMediaRequiresMatchingCodecConfig(t *testing.T) {
 			peerMapKey(sender.LocalAddr().(*net.UDPAddr)): {
 				addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID, authenticated: true,
 				controlSessionID: sessionID, controlKeyID: 1, controlHighest: 1, controlSeenWindow: 1,
+				membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute),
 			},
 			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {
 				addr: listener.LocalAddr().(*net.UDPAddr), senderId: listenerID, authenticated: true,
 				controlSessionID: 0x55667788, controlKeyID: 1, controlHighest: 1, controlSeenWindow: 1,
+				membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute),
 			},
 		},
 		activeTalkers:     map[uint32]time.Time{senderID: time.Now()},
@@ -514,7 +595,7 @@ func TestAuthenticatedMediaRequiresMatchingCodecConfig(t *testing.T) {
 		mediaCodecConfigs: make(map[uint32]codecConfigState),
 	}
 
-	configPayload := []byte{0, 2, 0x3e, 0x80, 0}
+	configPayload := []byte{0, 2, 0, 0, 0x3e, 0x80, 0}
 	configPayload = append(configPayload, base[:]...)
 	configRaw := buildAuthenticatedControlPacket(pktCodecConfig, channelID, senderID, configPayload, 1, key, uint64(sessionID)<<32|2)
 	config, ok := parsePacket(configRaw, false)
@@ -564,4 +645,248 @@ func buildAESGCMV2MediaPacket(packetType uint8, channelID uint32, senderID uint3
 	binary.BigEndian.PutUint32(packet[32:36], 2)
 	copy(packet[aesGCMV2HeaderSize:], ciphertext)
 	return packet
+}
+
+func TestRelayOutboundControlUsesIncrementingSequence(t *testing.T) {
+	relay := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 79
+	const listenerID uint32 = 7201
+
+	s := newServer(relay, true, false, false, 0, false, 1)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {
+				addr:               listener.LocalAddr().(*net.UDPAddr),
+				senderId:           listenerID,
+				membershipLease:    30 * time.Second,
+				keepaliveInterval:  10 * time.Second,
+				membershipDeadline: time.Now().Add(time.Minute),
+			},
+		},
+		activeTalkers: make(map[uint32]time.Time),
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	s.sendServerConfig(channelID, listenerID)
+	first := receiveTestPacket(t, listener)
+	s.sendServerConfig(channelID, listenerID)
+	second := receiveTestPacket(t, listener)
+	if first.Header.Seq != 0 || second.Header.Seq != 1 {
+		t.Fatalf("Relay sequence values = %d, %d; want 0, 1", first.Header.Seq, second.Header.Seq)
+	}
+}
+
+func TestRelayReauthenticatedCodecConfigPreservesVerifiedControlKeyID(t *testing.T) {
+	relay := newTestUDPConn(t)
+	talker := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 80
+	const talkerID uint32 = 7301
+	const listenerID uint32 = 7302
+	const sessionID uint32 = 0x10203040
+	keyOne := []byte("0123456789abcdef0123456789abcdef")
+	keyTwo := []byte("abcdefghijklmnopqrstuvwxyz012345")
+	state, err := newControlAuthState(controlAuthRequired, controlKeyStore{channelID: {1: keyOne, 2: keyTwo}}, []byte("relay-cookie-secret-must-have-at-least-32-bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := newServer(relay, false, false, false, 0, true, 2)
+	s.configureControlAuth(state)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(talker.LocalAddr().(*net.UDPAddr)): {
+				addr: talker.LocalAddr().(*net.UDPAddr), senderId: talkerID, authenticated: true,
+				controlSessionID: sessionID, controlKeyID: 1, controlHighest: 1, controlSeenWindow: 1,
+				membershipLease: 30 * time.Second, keepaliveInterval: 10 * time.Second, membershipDeadline: time.Now().Add(time.Minute),
+			},
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {
+				addr: listener.LocalAddr().(*net.UDPAddr), senderId: listenerID, authenticated: true,
+				controlSessionID: 0x50607080, controlKeyID: 2, controlHighest: 1, controlSeenWindow: 1,
+				membershipLease: 30 * time.Second, keepaliveInterval: 10 * time.Second, membershipDeadline: time.Now().Add(time.Minute),
+			},
+		},
+		activeTalkers:     make(map[uint32]time.Time),
+		codecConfigs:      make(map[uint32][]byte),
+		mediaCodecConfigs: make(map[uint32]codecConfigState),
+	}
+
+	base := [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	payload := append([]byte{0, 2, 0, 0, 0x2e, 0xe0, 0}, base[:]...)
+	raw := buildAuthenticatedControlPacket(pktCodecConfig, channelID, talkerID, payload, 1, keyOne, uint64(sessionID)<<32|2)
+	pkt, ok := parsePacket(raw, false)
+	if !ok {
+		t.Fatal("parse CODEC_CONFIG")
+	}
+	s.handlePacket(pkt, talker.LocalAddr().(*net.UDPAddr))
+	_ = receiveTestPacket(t, talker)
+	forwarded := receiveTestPacket(t, listener)
+	if forwarded.Sec.KeyID != 1 {
+		t.Fatalf("forwarded control_key_id = %d, want verified source key 1", forwarded.Sec.KeyID)
+	}
+	if !verifyControlAuthPacket(forwarded, keyOne) || verifyControlAuthPacket(forwarded, keyTwo) {
+		t.Fatal("forwarded CODEC_CONFIG was not reauthenticated with the source control key")
+	}
+	if forwarded.Header.Seq == pkt.Header.Seq {
+		t.Fatal("forwarded CODEC_CONFIG reused the client fixed-header sequence")
+	}
+}
+
+func TestControlAuthRelayNonceRolloverDoesNotWrap(t *testing.T) {
+	state, _ := newRequiredControlAuthState(t, 81)
+	state.mu.Lock()
+	state.relayInstanceID = 0x12345678
+	state.usedRelayInstanceIDs[0x12345678] = struct{}{}
+	state.relayCounter = ^uint32(0)
+	state.relayCounterExhausted = false
+	state.mu.Unlock()
+
+	last, ok := state.nextRelayNonce()
+	if !ok || last != 0x12345678ffffffff {
+		t.Fatalf("final nonce = %016x, ok=%t", last, ok)
+	}
+	next, ok := state.nextRelayNonce()
+	if !ok {
+		t.Fatal("nonce rollover failed closed despite available CSPRNG")
+	}
+	if uint32(next) != 0 {
+		t.Fatalf("rollover counter = %d, want 0", uint32(next))
+	}
+	if uint32(next>>32) == 0x12345678 || uint32(next>>32) == 0 {
+		t.Fatalf("rollover instance ID = %08x", uint32(next>>32))
+	}
+}
+
+func TestControlAuthProvisionalReplayWindowPromotesPreJoinCounters(t *testing.T) {
+	const channelID uint32 = 82
+	const senderID uint32 = 7401
+	const sessionID uint32 = 0x66778899
+	state, key := newRequiredControlAuthState(t, channelID)
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 20), Port: 50002}
+
+	helloRaw := buildAuthenticatedControlPacket(pktAuthHello, channelID, senderID, nil, 1, key, uint64(sessionID)<<32)
+	hello, ok := parsePacket(helloRaw, false)
+	if !ok {
+		t.Fatal("parse AUTH_HELLO")
+	}
+	challenge, err := state.createChallenge(hello, addr, controlAuthMeta{keyID: 1, sessionID: sessionID, counter: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginRaw := buildAuthenticatedControlPacket(0x12, channelID, senderID, []byte{1}, 1, key, uint64(sessionID)<<32|1)
+	begin, ok := parsePacket(beginRaw, false)
+	if !ok || !state.acceptPreJoinControl(begin, addr, controlAuthMeta{keyID: 1, sessionID: sessionID, counter: 1}) {
+		t.Fatal("pre-JOIN authenticated counter was rejected")
+	}
+	if state.acceptPreJoinControl(begin, addr, controlAuthMeta{keyID: 1, sessionID: sessionID, counter: 1}) {
+		t.Fatal("replayed pre-JOIN counter was accepted")
+	}
+	joinRaw := buildAuthenticatedControlPacket(pktJoin, channelID, senderID, challenge, 1, key, uint64(sessionID)<<32|2)
+	join, ok := parsePacket(joinRaw, false)
+	if !ok {
+		t.Fatal("parse JOIN")
+	}
+	replay, ok := state.consumeJoinChallenge(join, addr, controlAuthMeta{keyID: 1, sessionID: sessionID, counter: 2})
+	if !ok || replay.highest != 2 || replay.seen&0x7 != 0x7 {
+		t.Fatalf("JOIN did not promote counters 0..2: %#v ok=%t", replay, ok)
+	}
+}
+
+func TestMembershipRefreshEligibilityAndSenderZeroRejection(t *testing.T) {
+	relay := newTestUDPConn(t)
+	client := newTestUDPConn(t)
+	const channelID uint32 = 83
+	const senderID uint32 = 7501
+	s := newServer(relay, true, false, false, 0, false, 1)
+	deadline := time.Now().Add(20 * time.Second)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(client.LocalAddr().(*net.UDPAddr)): {
+				addr: client.LocalAddr().(*net.UDPAddr), senderId: senderID,
+				membershipLease: 30 * time.Second, keepaliveInterval: 10 * time.Second, membershipDeadline: deadline,
+			},
+		},
+		activeTalkers: make(map[uint32]time.Time),
+		codecConfigs:  make(map[uint32][]byte),
+	}
+
+	pingRaw := buildControlPacket(pktPing, channelID, senderID, make([]byte, 8), true)
+	ping, ok := parsePacket(pingRaw, true)
+	if !ok {
+		t.Fatal("parse PING")
+	}
+	s.handlePacket(ping, client.LocalAddr().(*net.UDPAddr))
+	_ = receiveTestPacket(t, client)
+	if got := s.channels[channelID].peers[peerMapKey(client.LocalAddr().(*net.UDPAddr))].membershipDeadline; !got.Equal(deadline) {
+		t.Fatalf("PING changed membership deadline: got=%s want=%s", got, deadline)
+	}
+
+	keepaliveRaw := buildControlPacket(pktKeepalive, channelID, senderID, nil, true)
+	keepalive, ok := parsePacket(keepaliveRaw, true)
+	if !ok {
+		t.Fatal("parse KEEPALIVE")
+	}
+	s.handlePacket(keepalive, client.LocalAddr().(*net.UDPAddr))
+	if got := s.channels[channelID].peers[peerMapKey(client.LocalAddr().(*net.UDPAddr))].membershipDeadline; !got.After(deadline) {
+		t.Fatalf("KEEPALIVE did not refresh membership: got=%s old=%s", got, deadline)
+	}
+
+	zeroRaw := buildControlPacket(pktPttOn, channelID+1, 0, nil, true)
+	zero, ok := parsePacket(zeroRaw, true)
+	if !ok {
+		t.Fatal("parse zero-sender packet")
+	}
+	s.handlePacket(zero, client.LocalAddr().(*net.UDPAddr))
+	if _, found := s.channels[channelID+1]; found {
+		t.Fatal("sender_id=0 endpoint packet created channel state")
+	}
+}
+
+func TestMembershipExpiryReleasesTalkerAndClearsCodecState(t *testing.T) {
+	relay := newTestUDPConn(t)
+	expired := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 84
+	const expiredSenderID uint32 = 7601
+	const listenerID uint32 = 7602
+
+	s := newServer(relay, true, false, false, 0, false, 1)
+	codec := append([]byte{0, 2, 0, 0, 0x2e, 0xe0, 0}, make([]byte, 12)...)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(expired.LocalAddr().(*net.UDPAddr)): {
+				addr: expired.LocalAddr().(*net.UDPAddr), senderId: expiredSenderID,
+				membershipLease: 30 * time.Second, keepaliveInterval: 10 * time.Second, membershipDeadline: time.Now().Add(-time.Second),
+			},
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {
+				addr: listener.LocalAddr().(*net.UDPAddr), senderId: listenerID,
+				membershipLease: 30 * time.Second, keepaliveInterval: 10 * time.Second, membershipDeadline: time.Now().Add(time.Minute),
+			},
+		},
+		activeTalkers: map[uint32]time.Time{expiredSenderID: time.Now()},
+		codecConfigs:  map[uint32][]byte{expiredSenderID: codec},
+		mediaCodecConfigs: map[uint32]codecConfigState{
+			expiredSenderID: {payload: codec, mediaKeyID: 2},
+		},
+	}
+
+	s.emitMembershipExpirations(channelID)
+	packet := receiveTestPacket(t, listener)
+	if packet.Header.Type != pktTalkRelease || packet.Header.SenderId != expiredSenderID || len(packet.Payload) != 5 || packet.Payload[4] != talkReleaseMembershipTimeout {
+		t.Fatalf("membership expiry release = type=%d sender=%d payload=%x", packet.Header.Type, packet.Header.SenderId, packet.Payload)
+	}
+	ch := s.channels[channelID]
+	if _, exists := ch.peers[peerMapKey(expired.LocalAddr().(*net.UDPAddr))]; exists {
+		t.Fatal("expired member was retained")
+	}
+	if _, exists := ch.activeTalkers[expiredSenderID]; exists {
+		t.Fatal("expired talker remained active")
+	}
+	if _, exists := ch.codecConfigs[expiredSenderID]; exists {
+		t.Fatal("expired sender CODEC_CONFIG cache was retained")
+	}
+	if _, exists := ch.mediaCodecConfigs[expiredSenderID]; exists {
+		t.Fatal("expired sender media CODEC_CONFIG cache was retained")
+	}
 }

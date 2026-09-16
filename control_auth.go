@@ -20,10 +20,11 @@ import (
 )
 
 const (
-	controlAuthHeaderSize = 12
-	controlAuthPacketSize = fixedHeaderSize + controlAuthHeaderSize
-	controlAuthCookieTTL  = 30 * time.Second
-	controlReplayWindow   = 64
+	controlAuthHeaderSize         = 12
+	controlAuthPacketSize         = fixedHeaderSize + controlAuthHeaderSize
+	controlAuthCookieTTL          = 30 * time.Second
+	controlReplayWindow           = 64
+	maxProvisionalControlSessions = 1024
 )
 
 type controlAuthPolicy string
@@ -37,13 +38,16 @@ const (
 type controlKeyStore map[uint32]map[uint32][]byte
 
 type controlAuthState struct {
-	mu              sync.Mutex
-	policy          controlAuthPolicy
-	keys            controlKeyStore
-	cookieSecret    []byte
-	relayInstanceID uint32
-	relayCounter    uint32
-	challenges      map[authChallengeKey]time.Time
+	mu                    sync.Mutex
+	policy                controlAuthPolicy
+	keys                  controlKeyStore
+	cookieSecret          []byte
+	relayInstanceID       uint32
+	relayCounter          uint32
+	relayCounterExhausted bool
+	usedRelayInstanceIDs  map[uint32]struct{}
+	challenges            map[authChallengeKey]time.Time
+	provisional           map[provisionalReplayKey]provisionalReplayState
 }
 
 type authChallengeKey struct {
@@ -62,6 +66,20 @@ type controlAuthMeta struct {
 	counter   uint32
 }
 
+type provisionalReplayKey struct {
+	channelID uint32
+	senderID  uint32
+	keyID     uint32
+	sessionID uint32
+	address   string
+}
+
+type provisionalReplayState struct {
+	highest   uint32
+	seen      uint64
+	expiresAt time.Time
+}
+
 func newControlAuthState(policy controlAuthPolicy, keys controlKeyStore, cookieSecret []byte) (*controlAuthState, error) {
 	if policy != controlAuthOff && policy != controlAuthOptional && policy != controlAuthRequired {
 		return nil, fmt.Errorf("unsupported control authentication policy %q", policy)
@@ -77,20 +95,19 @@ func newControlAuthState(policy controlAuthPolicy, keys controlKeyStore, cookieS
 	}
 
 	state := &controlAuthState{
-		policy:       policy,
-		keys:         keys,
-		cookieSecret: append([]byte(nil), cookieSecret...),
-		challenges:   make(map[authChallengeKey]time.Time),
+		policy:               policy,
+		keys:                 keys,
+		cookieSecret:         append([]byte(nil), cookieSecret...),
+		usedRelayInstanceIDs: make(map[uint32]struct{}),
+		challenges:           make(map[authChallengeKey]time.Time),
+		provisional:          make(map[provisionalReplayKey]provisionalReplayState),
 	}
 	if policy != controlAuthOff {
-		var instance [4]byte
-		if _, err := rand.Read(instance[:]); err != nil {
-			return nil, fmt.Errorf("generate relay control instance ID: %w", err)
+		instance, err := state.newRelayInstanceIDLocked()
+		if err != nil {
+			return nil, err
 		}
-		state.relayInstanceID = binary.BigEndian.Uint32(instance[:])
-		if state.relayInstanceID == 0 {
-			state.relayInstanceID = 1
-		}
+		state.relayInstanceID = instance
 	}
 	return state, nil
 }
@@ -230,13 +247,17 @@ func verifyControlAuthPacket(pkt parsedPacket, key []byte) bool {
 }
 
 func buildAuthenticatedControlPacket(pktType uint8, channelID uint32, senderID uint32, payload []byte, keyID uint32, key []byte, nonce uint64) []byte {
+	return buildAuthenticatedControlPacketWithSeq(pktType, channelID, senderID, payload, keyID, key, nonce, 0)
+}
+
+func buildAuthenticatedControlPacketWithSeq(pktType uint8, channelID uint32, senderID uint32, payload []byte, keyID uint32, key []byte, nonce uint64, sequence uint16) []byte {
 	packet := make([]byte, controlAuthPacketSize+len(payload)+authTagSize)
 	packet[0] = protocolVersion
 	packet[1] = pktType
 	binary.BigEndian.PutUint16(packet[2:4], controlAuthPacketSize)
 	binary.BigEndian.PutUint32(packet[4:8], channelID)
 	binary.BigEndian.PutUint32(packet[8:12], senderID)
-	binary.BigEndian.PutUint16(packet[12:14], 0)
+	binary.BigEndian.PutUint16(packet[12:14], sequence)
 	binary.BigEndian.PutUint16(packet[14:16], packetFlagControlAuthV1)
 	binary.BigEndian.PutUint64(packet[16:24], nonce)
 	binary.BigEndian.PutUint32(packet[24:28], keyID)
@@ -245,12 +266,45 @@ func buildAuthenticatedControlPacket(pktType uint8, channelID uint32, senderID u
 	return packet
 }
 
-func (a *controlAuthState) nextRelayNonce() uint64 {
+func (a *controlAuthState) newRelayInstanceIDLocked() (uint32, error) {
+	for attempts := 0; attempts < 32; attempts++ {
+		var encoded [4]byte
+		if _, err := rand.Read(encoded[:]); err != nil {
+			return 0, fmt.Errorf("generate relay control instance ID: %w", err)
+		}
+		instanceID := binary.BigEndian.Uint32(encoded[:])
+		if instanceID == 0 {
+			continue
+		}
+		if _, used := a.usedRelayInstanceIDs[instanceID]; used {
+			continue
+		}
+		a.usedRelayInstanceIDs[instanceID] = struct{}{}
+		return instanceID, nil
+	}
+	return 0, errors.New("could not generate a fresh non-zero relay control instance ID")
+}
+
+func (a *controlAuthState) nextRelayNonce() (uint64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.relayCounterExhausted {
+		instanceID, err := a.newRelayInstanceIDLocked()
+		if err != nil {
+			log.Printf("control authentication relay nonce rollover failed: %v", err)
+			return 0, false
+		}
+		a.relayInstanceID = instanceID
+		a.relayCounter = 0
+		a.relayCounterExhausted = false
+	}
 	nonce := uint64(a.relayInstanceID)<<32 | uint64(a.relayCounter)
-	a.relayCounter++
-	return nonce
+	if a.relayCounter == ^uint32(0) {
+		a.relayCounterExhausted = true
+	} else {
+		a.relayCounter++
+	}
+	return nonce, true
 }
 
 func (a *controlAuthState) createChallenge(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta) ([]byte, error) {
@@ -270,14 +324,25 @@ func (a *controlAuthState) createChallenge(pkt parsedPacket, addr *net.UDPAddr, 
 	copy(challengeKey.cookie[:], cookie)
 
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	now := time.Now()
-	for candidate, deadline := range a.challenges {
-		if !deadline.After(now) {
-			delete(a.challenges, candidate)
-		}
+	a.cleanupPendingLocked(now)
+	if len(a.provisional) >= maxProvisionalControlSessions {
+		return nil, errors.New("too many pending control authentication sessions")
 	}
-	a.challenges[challengeKey] = time.Unix(int64(expiresAt), 0)
-	a.mu.Unlock()
+	replayKey := provisionalReplayKey{
+		channelID: pkt.Header.ChannelId,
+		senderID:  pkt.Header.SenderId,
+		keyID:     meta.keyID,
+		sessionID: meta.sessionID,
+		address:   peerMapKey(addr),
+	}
+	if _, exists := a.provisional[replayKey]; exists {
+		return nil, errors.New("control session is already awaiting JOIN")
+	}
+	expires := time.Unix(int64(expiresAt), 0)
+	a.challenges[challengeKey] = expires
+	a.provisional[replayKey] = provisionalReplayState{highest: 0, seen: 1, expiresAt: expires}
 
 	payload := make([]byte, 20)
 	binary.BigEndian.PutUint32(payload[:4], expiresAt)
@@ -285,32 +350,83 @@ func (a *controlAuthState) createChallenge(pkt parsedPacket, addr *net.UDPAddr, 
 	return payload, nil
 }
 
-func (a *controlAuthState) consumeJoinChallenge(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta) bool {
-	if meta.counter != 1 || meta.sessionID == 0 || addr == nil || len(pkt.Payload) != 20 {
+func (a *controlAuthState) cleanupPendingLocked(now time.Time) {
+	for candidate, deadline := range a.challenges {
+		if !deadline.After(now) {
+			delete(a.challenges, candidate)
+		}
+	}
+	for candidate, state := range a.provisional {
+		if !state.expiresAt.After(now) {
+			delete(a.provisional, candidate)
+		}
+	}
+}
+
+// acceptPreJoinControl extends the AUTH_HELLO replay window for a future
+// authenticated admission exchange. It intentionally does not create durable
+// membership state.
+func (a *controlAuthState) acceptPreJoinControl(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta) bool {
+	if meta.sessionID == 0 || addr == nil {
 		return false
+	}
+	key := provisionalReplayKey{
+		channelID: pkt.Header.ChannelId,
+		senderID:  pkt.Header.SenderId,
+		keyID:     meta.keyID,
+		sessionID: meta.sessionID,
+		address:   peerMapKey(addr),
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cleanupPendingLocked(time.Now())
+	state, found := a.provisional[key]
+	if !found || !acceptReplayCounter(&state.highest, &state.seen, meta.counter) {
+		return false
+	}
+	a.provisional[key] = state
+	return true
+}
+
+func (a *controlAuthState) consumeJoinChallenge(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta) (provisionalReplayState, bool) {
+	if meta.sessionID == 0 || addr == nil || len(pkt.Payload) != 20 {
+		return provisionalReplayState{}, false
 	}
 	expiresAt := binary.BigEndian.Uint32(pkt.Payload[:4])
 	if expiresAt < uint32(time.Now().Unix()) {
-		return false
+		return provisionalReplayState{}, false
 	}
 	want := a.cookie(pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, meta.sessionID, expiresAt, addr)
 	if subtle.ConstantTimeCompare(want, pkt.Payload[4:]) != 1 {
-		return false
+		return provisionalReplayState{}, false
 	}
 	challengeKey := authChallengeKey{
 		channelID: pkt.Header.ChannelId, senderID: pkt.Header.SenderId, keyID: meta.keyID,
 		sessionID: meta.sessionID, address: peerMapKey(addr), expiresAt: expiresAt,
 	}
 	copy(challengeKey.cookie[:], pkt.Payload[4:])
+	replayKey := provisionalReplayKey{
+		channelID: pkt.Header.ChannelId,
+		senderID:  pkt.Header.SenderId,
+		keyID:     meta.keyID,
+		sessionID: meta.sessionID,
+		address:   peerMapKey(addr),
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.cleanupPendingLocked(time.Now())
 	deadline, found := a.challenges[challengeKey]
 	if !found || !deadline.After(time.Now()) {
 		delete(a.challenges, challengeKey)
-		return false
+		return provisionalReplayState{}, false
+	}
+	state, found := a.provisional[replayKey]
+	if !found || !acceptReplayCounter(&state.highest, &state.seen, meta.counter) {
+		return provisionalReplayState{}, false
 	}
 	delete(a.challenges, challengeKey)
-	return true
+	delete(a.provisional, replayKey)
+	return state, true
 }
 
 func (a *controlAuthState) cookie(channelID uint32, senderID uint32, keyID uint32, sessionID uint32, expiresAt uint32, addr *net.UDPAddr) []byte {
@@ -363,6 +479,13 @@ func (s *server) verifyIncomingControl(pkt parsedPacket) (controlAuthMeta, bool)
 }
 
 func (s *server) upsertAuthenticatedPeer(channelID uint32, senderID uint32, addr *net.UDPAddr, meta controlAuthMeta) {
+	s.upsertAuthenticatedPeerWithReplay(channelID, senderID, addr, meta, provisionalReplayState{
+		highest: meta.counter,
+		seen:    1,
+	})
+}
+
+func (s *server) upsertAuthenticatedPeerWithReplay(channelID uint32, senderID uint32, addr *net.UDPAddr, meta controlAuthMeta, replay provisionalReplayState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ch := s.getOrCreateChannel(channelID)
@@ -381,8 +504,8 @@ func (s *server) upsertAuthenticatedPeer(channelID uint32, senderID uint32, addr
 	p.authenticated = true
 	p.controlSessionID = meta.sessionID
 	p.controlKeyID = meta.keyID
-	p.controlHighest = meta.counter
-	p.controlSeenWindow = 1
+	p.controlHighest = replay.highest
+	p.controlSeenWindow = replay.seen
 }
 
 func (s *server) acceptAuthenticatedPeerControl(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta) bool {
@@ -462,7 +585,11 @@ func (s *server) sendAuthenticatedChallenge(addr *net.UDPAddr, channelID uint32,
 	if len(key) != 32 {
 		return
 	}
-	packet := buildAuthenticatedControlPacket(pktAuthChallenge, channelID, senderID, payload, keyID, key, s.controlAuth.nextRelayNonce())
+	nonce, ok := s.controlAuth.nextRelayNonce()
+	if !ok {
+		return
+	}
+	packet := buildAuthenticatedControlPacketWithSeq(pktAuthChallenge, channelID, senderID, payload, keyID, key, nonce, s.nextRelaySequence())
 	if _, err := s.conn.WriteToUDP(packet, addr); err != nil {
 		log.Printf("auth_challenge send failed ch=%d sender=%d: %v", channelID, senderID, err)
 	}
@@ -470,7 +597,7 @@ func (s *server) sendAuthenticatedChallenge(addr *net.UDPAddr, channelID uint32,
 
 func (s *server) relayControlForPeer(channelID uint32, peer *peer, packetType uint8, senderID uint32, payload []byte) []byte {
 	if !s.controlAuthRequired(channelID) {
-		return buildControlPacket(packetType, channelID, senderID, payload, s.noCrypto)
+		return buildRelayControlPacket(packetType, channelID, senderID, payload, s.noCrypto, s.nextRelaySequence())
 	}
 	if s.controlAuth == nil || peer == nil || !peer.authenticated {
 		return nil
@@ -480,7 +607,65 @@ func (s *server) relayControlForPeer(channelID uint32, peer *peer, packetType ui
 	if len(key) != 32 {
 		return nil
 	}
-	return buildAuthenticatedControlPacket(packetType, channelID, senderID, payload, keyID, key, s.controlAuth.nextRelayNonce())
+	nonce, ok := s.controlAuth.nextRelayNonce()
+	if !ok {
+		return nil
+	}
+	return buildAuthenticatedControlPacketWithSeq(packetType, channelID, senderID, payload, keyID, key, nonce, s.nextRelaySequence())
+}
+
+func (s *server) relayCodecConfigForPeer(channelID uint32, peer *peer, senderID uint32, config codecConfigState) []byte {
+	if !s.controlAuthRequired(channelID) {
+		return buildRelayControlPacket(pktCodecConfig, channelID, senderID, config.payload, s.noCrypto, s.nextRelaySequence())
+	}
+	if s.controlAuth == nil || peer == nil || !peer.authenticated || config.controlKeyID == 0 {
+		return nil
+	}
+	key := s.controlAuth.key(channelID, config.controlKeyID)
+	if len(key) != 32 {
+		return nil
+	}
+	nonce, ok := s.controlAuth.nextRelayNonce()
+	if !ok {
+		return nil
+	}
+	return buildAuthenticatedControlPacketWithSeq(pktCodecConfig, channelID, senderID, config.payload, config.controlKeyID, key, nonce, s.nextRelaySequence())
+}
+
+func (s *server) sendRelayCodecConfig(channelID uint32, senderID uint32, config codecConfigState) {
+	s.mu.Lock()
+	ch := s.channels[channelID]
+	peers := make([]*peer, 0)
+	if ch != nil {
+		for _, peer := range ch.peers {
+			peers = append(peers, peer)
+		}
+	}
+	s.mu.Unlock()
+	for _, peer := range peers {
+		if packet := s.relayCodecConfigForPeer(channelID, peer, senderID, config); len(packet) > 0 {
+			_, _ = s.conn.WriteToUDP(packet, peer.addr)
+		}
+	}
+}
+
+func (s *server) sendRelayCodecConfigTo(channelID uint32, targetSenderID uint32, senderID uint32, config codecConfigState) {
+	s.mu.Lock()
+	ch := s.channels[channelID]
+	peers := make([]*peer, 0)
+	if ch != nil {
+		for _, peer := range ch.peers {
+			if peer.senderId == targetSenderID {
+				peers = append(peers, peer)
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, peer := range peers {
+		if packet := s.relayCodecConfigForPeer(channelID, peer, senderID, config); len(packet) > 0 {
+			_, _ = s.conn.WriteToUDP(packet, peer.addr)
+		}
+	}
 }
 
 func (s *server) sendRelayControlTo(channelID uint32, targetSenderID uint32, packetType uint8, senderID uint32, payload []byte) {

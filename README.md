@@ -43,8 +43,32 @@ Notes:
 - `0` disables timeout.
 - If both are set, `-talk-max-sec` takes precedence.
 - On channel join, server sends this value to clients via `pktServerCfg` so clients can show remaining TX time.
-- `TALK_RELEASE` carries the v1 release reason: client PTT off, server timeout,
-  membership timeout, or client leave.
+- `TALK_RELEASE` carries the Version 1 release reason, including client PTT off,
+  server timeout, membership timeout, client leave, and optional admission or
+  preemption policy outcomes.
+
+## Membership lease and keepalive
+
+The Relay advertises an eight-byte `SERVER_CONFIG` after each successful JOIN.
+It includes a per-membership snapshot of the normal talk limit, multi-talker
+policy, membership lease, and idle keepalive interval.
+
+```bash
+INCOMUDON_MEMBERSHIP_LEASE_SEC=30 \
+INCOMUDON_KEEPALIVE_INTERVAL_SEC=10 \
+go run . -port 50000
+```
+
+Equivalent flags are `-membership-lease-sec` and `-keepalive-interval-sec`.
+The lease must be `15..300` seconds and keepalive must be `1..floor(lease/3)`
+seconds. Defaults are 30 and 10 seconds. Existing members retain the timing
+snapshot accepted at JOIN; a later configuration change applies only to a new
+JOIN.
+
+Only accepted `KEEPALIVE`, `CODEC_CONFIG`, PTT control, and authorized active
+`AUDIO`/`FEC` refresh membership. `PING`/`PONG` are RTT probes and never extend
+the membership deadline. `-timeout` remains a deprecated whole-second alias
+for `-membership-lease-sec`.
 
 ## Simultaneous transmit (multi-talk)
 
@@ -74,14 +98,16 @@ Notes:
 
 ## Control Authentication v1
 
-The relay supports the v0.5 Control Authentication v1 handshake and gates
+The relay supports the v0.7 Control Authentication v1 handshake and gates
 AES-GCM v2 media on a verified, per-channel control session. It validates
 authenticated `AUTH_HELLO` / `AUTH_CHALLENGE` / `JOIN` traffic, performs the
-64-counter control replay check, caches only verified 17-byte `CODEC_CONFIG`
-payloads, and re-signs Relay-generated control packets separately for every
-recipient. Media remains end-to-end protected and is forwarded byte-for-byte;
-the receiving client remains responsible for AEAD authentication and media
-replay detection.
+64-counter control replay check across provisional pre-JOIN state and the
+joined session, caches only verified 19-byte `CODEC_CONFIG` payloads, and
+re-signs Relay-generated control packets separately for every recipient.
+Relay-generated packets use an independent fixed-header sequence space and a
+non-wrapping Relay control nonce domain. Media remains end-to-end protected and
+is forwarded byte-for-byte; the receiving client remains responsible for AEAD
+authentication and media replay detection.
 
 Configure it with these environment variables or their CLI equivalents:
 
@@ -94,9 +120,12 @@ go run . -port 50000
 
 `INCOMUDON_CONTROL_AUTH_POLICY` accepts:
 
-- `off`: preserve legacy control compatibility; AES-GCM v2 media is rejected.
+- `off`: preserve no-crypto or legacy compatibility control behavior; AES-GCM
+  v2 media is rejected.
 - `optional`: require authentication only for channels listed in the key CSV.
-- `required`: require authenticated control traffic for every channel.
+- `required`: require authenticated control traffic and the AES-GCM v2 media
+  profile for every channel. No-crypto and legacy-xor `CODEC_CONFIG` values are
+  rejected even when their control HMAC is valid.
 
 The key CSV is intentionally not stored in source control:
 
@@ -125,7 +154,9 @@ INCOMUDON_CONTROL_KEY_FILE=/run/incomudon-control/control-keys.csv
 INCOMUDON_CONTROL_COOKIE_SECRET_FILE=/run/incomudon-control/cookie.secret
 ```
 
-`-no-crypto` cannot be combined with `required` policy.
+`-no-crypto` cannot be combined with `required` policy. Endpoint-originated
+packets with `sender_id = 0` are rejected before they can create membership,
+talk, or authentication state; zero remains reserved for Relay/System packets.
 
 ## Directory Provisioning
 

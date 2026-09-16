@@ -25,6 +25,11 @@ const (
 	maxUDPDatagramBytes                = 1200
 	maxActiveTalkersV1                 = 16
 	udpNearLimitBytes                  = 1150
+	defaultMembershipLease             = 30 * time.Second
+	defaultKeepaliveInterval           = 10 * time.Second
+	minimumMembershipLease             = 15 * time.Second
+	maximumMembershipLease             = 300 * time.Second
+	minimumKeepaliveInterval           = time.Second
 )
 
 const (
@@ -52,6 +57,11 @@ const (
 	talkReleaseServerTimeout     = 0x01
 	talkReleaseMembershipTimeout = 0x02
 	talkReleaseClientLeave       = 0x03
+	talkReleaseServerPolicy      = 0x04
+	talkReleaseIdentityExpired   = 0x05
+	talkReleaseServiceRevoked    = 0x06
+	talkReleasePreempted         = 0x07
+	talkReleaseServiceExpired    = 0x08
 )
 
 type packetHeader struct {
@@ -80,20 +90,24 @@ type parsedPacket struct {
 }
 
 type peer struct {
-	senderId          uint32
-	addr              *net.UDPAddr
-	lastSeen          time.Time
-	authenticated     bool
-	controlSessionID  uint32
-	controlKeyID      uint32
-	controlHighest    uint32
-	controlSeenWindow uint64
+	senderId           uint32
+	addr               *net.UDPAddr
+	lastSeen           time.Time
+	authenticated      bool
+	controlSessionID   uint32
+	controlKeyID       uint32
+	controlHighest     uint32
+	controlSeenWindow  uint64
+	membershipLease    time.Duration
+	keepaliveInterval  time.Duration
+	membershipDeadline time.Time
 }
 
 type codecConfigState struct {
 	payload        []byte
 	mediaNonceBase [12]byte
 	mediaKeyID     uint32
+	controlKeyID   uint32
 }
 
 type channel struct {
@@ -121,6 +135,10 @@ type server struct {
 	multiTalk           bool
 	maxActiveTalkers    int
 	controlAuth         *controlAuthState
+	membershipLease     time.Duration
+	keepaliveInterval   time.Duration
+	outboundMu          sync.Mutex
+	outboundSeq         uint16
 }
 
 func peerMapKey(addr *net.UDPAddr) string {
@@ -138,20 +156,50 @@ func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool,
 		maxActiveTalkers = maxActiveTalkersV1
 	}
 	return &server{
-		channels:         make(map[uint32]*channel),
-		conn:             conn,
-		noCrypto:         noCrypto,
-		logPackets:       logPackets,
-		logAudio:         logAudio,
-		sizeWindowStart:  time.Now(),
-		talkMax:          talkMax,
-		multiTalk:        multiTalk,
-		maxActiveTalkers: maxActiveTalkers,
+		channels:          make(map[uint32]*channel),
+		conn:              conn,
+		noCrypto:          noCrypto,
+		logPackets:        logPackets,
+		logAudio:          logAudio,
+		sizeWindowStart:   time.Now(),
+		talkMax:           talkMax,
+		multiTalk:         multiTalk,
+		maxActiveTalkers:  maxActiveTalkers,
+		membershipLease:   defaultMembershipLease,
+		keepaliveInterval: defaultKeepaliveInterval,
 	}
 }
 
 func (s *server) configureControlAuth(state *controlAuthState) {
 	s.controlAuth = state
+}
+
+func validMembershipTiming(lease time.Duration, keepalive time.Duration) bool {
+	if lease < minimumMembershipLease || lease > maximumMembershipLease ||
+		lease%time.Second != 0 || keepalive < minimumKeepaliveInterval ||
+		keepalive%time.Second != 0 {
+		return false
+	}
+	return keepalive <= lease/3
+}
+
+func (s *server) configureMembershipTiming(lease time.Duration, keepalive time.Duration) error {
+	if !validMembershipTiming(lease, keepalive) {
+		return fmt.Errorf("invalid membership timing lease=%s keepalive=%s", lease, keepalive)
+	}
+	s.mu.Lock()
+	s.membershipLease = lease
+	s.keepaliveInterval = keepalive
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *server) nextRelaySequence() uint16 {
+	s.outboundMu.Lock()
+	defer s.outboundMu.Unlock()
+	sequence := s.outboundSeq
+	s.outboundSeq++
+	return sequence
 }
 
 // directoryParticipants returns the relay's current peer view without exposing
@@ -239,9 +287,10 @@ func acceptsUDPDatagramSize(size int) bool {
 }
 
 func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
-	if pkt.Header.Version != protocolVersion {
+	if pkt.Header.Version != protocolVersion || pkt.Header.SenderId == 0 {
 		return
 	}
+	s.emitMembershipExpirations(pkt.Header.ChannelId)
 	if pkt.Header.Type == pktAudio || pkt.Header.Type == pktFec {
 		s.handleMediaPacket(pkt, addr)
 		return
@@ -281,21 +330,34 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 
 	if pkt.Header.Type == pktJoin && requiresAuth {
 		meta, ok := s.verifyIncomingControl(pkt)
-		if !ok || !s.controlAuth.consumeJoinChallenge(pkt, addr, meta) {
+		replay, ok := s.controlAuth.consumeJoinChallenge(pkt, addr, meta)
+		if !ok {
 			return
 		}
-		s.upsertAuthenticatedPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr, meta)
+		s.upsertAuthenticatedPeerWithReplay(pkt.Header.ChannelId, pkt.Header.SenderId, addr, meta, replay)
+		if !s.startMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+			return
+		}
+	} else if pkt.Header.Type == pktJoin {
+		if len(pkt.Payload) != 0 {
+			return
+		}
+		s.mu.Lock()
+		ch := s.getOrCreateChannel(pkt.Header.ChannelId)
+		s.upsertPeer(ch, pkt.Header.SenderId, addr)
+		s.mu.Unlock()
+		if !s.startMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+			return
+		}
 	} else if requiresAuth {
 		meta, ok := s.verifyIncomingControl(pkt)
 		if !ok || !s.acceptAuthenticatedPeerControl(pkt, addr, meta) {
 			return
 		}
 	} else {
-		// Compatibility channels retain the historic endpoint refresh behavior.
-		s.mu.Lock()
-		ch := s.getOrCreateChannel(pkt.Header.ChannelId)
-		s.upsertPeer(ch, pkt.Header.SenderId, addr)
-		s.mu.Unlock()
+		if !s.acceptUnauthenticatedPeerControl(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+			return
+		}
 	}
 
 	if releasedTalkerIDs := s.expireTalkIfNeeded(pkt.Header.ChannelId); len(releasedTalkerIDs) > 0 {
@@ -314,43 +376,65 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		s.sendServerConfig(pkt.Header.ChannelId, pkt.Header.SenderId)
 		s.sendCurrentTalkState(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktLeave:
+		if len(pkt.Payload) != 0 {
+			return
+		}
 		log.Printf("leave ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
-		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
 		s.releaseTalkIfNeeded(pkt.Header.ChannelId, pkt.Header.SenderId, talkReleaseClientLeave)
+		s.removePeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
+	case pktKeepalive:
+		if len(pkt.Payload) != 0 {
+			return
+		}
+		s.refreshMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
 	case pktPttOn:
+		if len(pkt.Payload) != 0 {
+			return
+		}
 		log.Printf("ptt_on ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
+		s.refreshMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
 		s.handlePttOn(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktPttOff:
+		if len(pkt.Payload) != 0 {
+			return
+		}
 		log.Printf("ptt_off ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
+		s.refreshMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
 		s.handlePttOff(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktCodecConfig:
-		if requiresAuth && len(pkt.Payload) != 17 {
+		controlKeyID := uint32(0)
+		if requiresAuth {
+			controlKeyID = pkt.Sec.KeyID
+		}
+		config, ok := s.cacheCodecConfig(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload, controlKeyID, requiresAuth)
+		if !ok {
 			return
 		}
-		if !s.cacheCodecConfig(pkt.Header.ChannelId, pkt.Header.SenderId, pkt.Payload) {
-			return
-		}
-		s.broadcastRelayControl(pkt.Header.ChannelId, pktCodecConfig, pkt.Header.SenderId, pkt.Payload)
+		s.refreshMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr)
+		s.sendRelayCodecConfig(pkt.Header.ChannelId, pkt.Header.SenderId, config)
 	default:
-		// Client-originated control packets are consumed by the Relay. Relay
-		// decisions are emitted through authenticated relay control packets.
+		// Unknown or extension-owned packet types are not accepted as ordinary
+		// membership activity. Their extension handler must opt in explicitly.
 	}
 }
 
 func (s *server) handleMediaPacket(pkt parsedPacket, addr *net.UDPAddr) {
-	if !s.isTalker(pkt.Header.ChannelId, pkt.Header.SenderId) {
+	if !s.isActiveTalkerEndpoint(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
 		return
 	}
 	if pkt.Header.Flags&packetFlagAESGCMV2HeaderAAD != 0 &&
-		s.controlAuth != nil && !s.controlAuthRequired(pkt.Header.ChannelId) {
+		!s.controlAuthRequired(pkt.Header.ChannelId) {
 		// AES-GCM v2 always requires Control Authentication v1. Optional and
-		// off policy modes may still serve legacy compatibility channels.
+		// off policy modes may still serve no-crypto and legacy-xor channels.
 		return
 	}
 	if s.controlAuthRequired(pkt.Header.ChannelId) {
 		if !s.isAuthenticatedPeer(pkt.Header.ChannelId, pkt.Header.SenderId, addr) || !s.mediaMatchesCodecConfig(pkt) {
 			return
 		}
+	}
+	if !s.refreshMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
+		return
 	}
 	// The Relay intentionally forwards authenticated media byte-for-byte. The
 	// receiver owns final AEAD authentication and replay-window enforcement.
@@ -392,42 +476,52 @@ func firstActiveTalker(ch *channel) uint32 {
 	return talkers[0]
 }
 
-func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []byte) bool {
-	if len(payload) < 3 {
-		return false
+func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []byte, controlKeyID uint32, authenticated bool) (codecConfigState, bool) {
+	if len(payload) != 19 {
+		return codecConfigState{}, false
 	}
-	if s.controlAuthRequired(channelId) {
-		if len(payload) != 17 {
-			return false
+	var zeroBase [12]byte
+	var announcedBase [12]byte
+	copy(announcedBase[:], payload[7:19])
+	hasAESGCMV2Base := announcedBase != zeroBase
+	if hasAESGCMV2Base {
+		// AES-GCM v2 always needs authenticated control and a configured
+		// Control Authentication channel, even outside required policy.
+		if !authenticated || controlKeyID == 0 || !s.controlAuthRequired(channelId) {
+			return codecConfigState{}, false
 		}
-		var zeroBase [12]byte
-		var announcedBase [12]byte
-		copy(announcedBase[:], payload[5:17])
-		if announcedBase == zeroBase {
-			return false
-		}
+	} else if s.controlAuthRequired(channelId) {
+		// The required policy is the AES-GCM-v2-only profile. A zero base is
+		// the no-crypto/legacy-xor compatibility form and is not selectable.
+		return codecConfigState{}, false
 	}
 
+	state := codecConfigState{
+		payload:        append([]byte(nil), payload...),
+		mediaNonceBase: announcedBase,
+		mediaKeyID:     2,
+		controlKeyID:   controlKeyID,
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ch := s.channels[channelId]
 	if ch == nil {
-		return false
+		return codecConfigState{}, false
 	}
 	if ch.codecConfigs == nil {
 		ch.codecConfigs = make(map[uint32][]byte)
 	}
 	ch.codecConfigs[senderId] = append(ch.codecConfigs[senderId][:0], payload...)
-	if len(payload) == 17 {
-		if ch.mediaCodecConfigs == nil {
-			ch.mediaCodecConfigs = make(map[uint32]codecConfigState)
-		}
-		state := codecConfigState{payload: append([]byte(nil), payload...), mediaKeyID: 2}
-		copy(state.mediaNonceBase[:], payload[5:17])
-		ch.mediaCodecConfigs[senderId] = state
+	if ch.mediaCodecConfigs == nil {
+		ch.mediaCodecConfigs = make(map[uint32]codecConfigState)
 	}
-	return true
+	if hasAESGCMV2Base {
+		ch.mediaCodecConfigs[senderId] = state
+	} else {
+		delete(ch.mediaCodecConfigs, senderId)
+	}
+	return state, true
 }
 
 func (s *server) upsertPeer(ch *channel, senderId uint32, addr *net.UDPAddr) {
@@ -485,12 +579,104 @@ func (s *server) touchKnownPeer(channelId uint32, senderId uint32, addr *net.UDP
 	return true
 }
 
+func (s *server) acceptUnauthenticatedPeerControl(channelId uint32, senderId uint32, addr *net.UDPAddr) bool {
+	if senderId == 0 || addr == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelId]
+	if ch == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	if peer == nil || peer.senderId != senderId {
+		return false
+	}
+	peer.lastSeen = time.Now()
+	return true
+}
+
+func (s *server) startMembership(channelId uint32, senderId uint32, addr *net.UDPAddr) bool {
+	if senderId == 0 || addr == nil {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelId]
+	if ch == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	if peer == nil || peer.senderId != senderId {
+		return false
+	}
+	peer.membershipLease = s.membershipLease
+	peer.keepaliveInterval = s.keepaliveInterval
+	peer.membershipDeadline = now.Add(peer.membershipLease)
+	peer.lastSeen = now
+	return true
+}
+
+func (s *server) refreshMembership(channelId uint32, senderId uint32, addr *net.UDPAddr) bool {
+	if senderId == 0 || addr == nil {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelId]
+	if ch == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	if peer == nil || peer.senderId != senderId || peer.membershipDeadline.IsZero() || !peer.membershipDeadline.After(now) {
+		return false
+	}
+	peer.membershipDeadline = now.Add(peer.membershipLease)
+	peer.lastSeen = now
+	return true
+}
+
+func (s *server) membershipTimingForPeer(channelId uint32, senderId uint32) (time.Duration, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ch := s.channels[channelId]; ch != nil {
+		for _, peer := range ch.peers {
+			if peer.senderId == senderId && peer.membershipLease > 0 && peer.keepaliveInterval > 0 {
+				return peer.membershipLease, peer.keepaliveInterval
+			}
+		}
+	}
+	return s.membershipLease, s.keepaliveInterval
+}
+
+func (s *server) isActiveTalkerEndpoint(channelId uint32, senderId uint32, addr *net.UDPAddr) bool {
+	if senderId == 0 || addr == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.channels[channelId]
+	if ch == nil {
+		return false
+	}
+	peer := ch.peers[peerMapKey(addr)]
+	if peer == nil || peer.senderId != senderId {
+		return false
+	}
+	_, active := ch.activeTalkers[senderId]
+	return active
+}
+
 func (s *server) sendPong(addr *net.UDPAddr, channelId uint32, senderId uint32, nonce []byte) {
 	if addr == nil || len(nonce) != 8 {
 		return
 	}
 	if !s.controlAuthRequired(channelId) {
-		_, _ = s.conn.WriteToUDP(buildControlPacket(pktPong, channelId, senderId, nonce, s.noCrypto), addr)
+		packet := buildRelayControlPacket(pktPong, channelId, senderId, nonce, s.noCrypto, s.nextRelaySequence())
+		_, _ = s.conn.WriteToUDP(packet, addr)
 		return
 	}
 
@@ -527,9 +713,16 @@ func (s *server) removePeer(channelId uint32, senderId uint32, addr *net.UDPAddr
 		for k, p := range ch.peers {
 			if p.senderId == senderId {
 				delete(ch.peers, k)
+				removed = true
 				break
 			}
 		}
+	}
+	if removed && senderId != 0 {
+		// A later endpoint that receives the same sender ID must publish a fresh
+		// configuration before its media can be accepted or replayed downstream.
+		delete(ch.codecConfigs, senderId)
+		delete(ch.mediaCodecConfigs, senderId)
 	}
 
 	if len(ch.peers) == 0 {
@@ -659,6 +852,42 @@ func (s *server) expireTalkIfNeeded(channelId uint32) []uint32 {
 	return released
 }
 
+func (s *server) expireMembershipIfNeeded(channelId uint32) []uint32 {
+	now := time.Now()
+	s.mu.Lock()
+	ch := s.channels[channelId]
+	if ch == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	released := make([]uint32, 0)
+	for key, peer := range ch.peers {
+		if peer.membershipDeadline.IsZero() || peer.membershipDeadline.After(now) {
+			continue
+		}
+		delete(ch.peers, key)
+		delete(ch.codecConfigs, peer.senderId)
+		delete(ch.mediaCodecConfigs, peer.senderId)
+		if _, active := ch.activeTalkers[peer.senderId]; active {
+			delete(ch.activeTalkers, peer.senderId)
+			released = append(released, peer.senderId)
+		}
+	}
+	if len(ch.peers) == 0 {
+		delete(s.channels, channelId)
+	}
+	s.mu.Unlock()
+	sort.Slice(released, func(i, j int) bool { return released[i] < released[j] })
+	return released
+}
+
+func (s *server) emitMembershipExpirations(channelId uint32) {
+	for _, senderId := range s.expireMembershipIfNeeded(channelId) {
+		log.Printf("talk_release ch=%d talker=%d reason=%d (membership_timeout)", channelId, senderId, talkReleaseMembershipTimeout)
+		s.broadcastRelayControl(channelId, pktTalkRelease, senderId, talkReleasePayload(senderId, talkReleaseMembershipTimeout))
+	}
+}
+
 func durationToSecondsClamped(d time.Duration) uint16 {
 	if d <= 0 {
 		return 0
@@ -674,7 +903,8 @@ func durationToSecondsClamped(d time.Duration) uint16 {
 }
 
 func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
-	payload := make([]byte, 4)
+	lease, keepalive := s.membershipTimingForPeer(channelId, senderId)
+	payload := make([]byte, 8)
 	binary.BigEndian.PutUint16(payload, durationToSecondsClamped(s.talkMax))
 	if s.multiTalk {
 		payload[2] |= 0x01
@@ -690,12 +920,14 @@ func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
 		}
 	}
 	payload[3] = byte(limit)
+	binary.BigEndian.PutUint16(payload[4:6], durationToSecondsClamped(lease))
+	binary.BigEndian.PutUint16(payload[6:8], durationToSecondsClamped(keepalive))
 	s.sendRelayControlTo(channelId, senderId, pktServerCfg, 0, payload)
 }
 
 type talkerSyncState struct {
-	talkerID    uint32
-	codecConfig []byte
+	talkerID uint32
+	codec    codecConfigState
 }
 
 func (s *server) sendCurrentTalkState(channelId uint32, senderId uint32) {
@@ -708,19 +940,23 @@ func (s *server) sendCurrentTalkState(channelId uint32, senderId uint32) {
 	talkers := sortedActiveTalkers(ch)
 	states := make([]talkerSyncState, 0, len(talkers))
 	for _, talkerID := range talkers {
+		codec := ch.mediaCodecConfigs[talkerID]
+		if len(codec.payload) == 0 {
+			codec.payload = append([]byte(nil), ch.codecConfigs[talkerID]...)
+		}
 		states = append(states, talkerSyncState{
-			talkerID:    talkerID,
-			codecConfig: append([]byte(nil), ch.codecConfigs[talkerID]...),
+			talkerID: talkerID,
+			codec:    codec,
 		})
 	}
 	s.mu.Unlock()
 
 	for _, state := range states {
 		// Configure the per-talker decoder before announcing that audio may arrive.
-		if len(state.codecConfig) >= 3 {
-			s.sendRelayControlTo(channelId, senderId, pktCodecConfig, state.talkerID, state.codecConfig)
+		if len(state.codec.payload) == 19 {
+			s.sendRelayCodecConfigTo(channelId, senderId, state.talkerID, state.codec)
 		}
-		log.Printf("join_sync_talker ch=%d to=%d talker=%d codec_config=%t", channelId, senderId, state.talkerID, len(state.codecConfig) >= 3)
+		log.Printf("join_sync_talker ch=%d to=%d talker=%d codec_config=%t", channelId, senderId, state.talkerID, len(state.codec.payload) == 19)
 		s.sendRelayControlTo(channelId, senderId, pktTalkGrant, state.talkerID, talkPayload(state.talkerID))
 	}
 }
@@ -793,6 +1029,9 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 	if interval <= 0 {
 		interval = time.Second
 	}
+	if interval > time.Second {
+		interval = time.Second
+	}
 	// Check monotonic talk deadlines independently of peer expiry.  Waiting for
 	// the normal 15-second peer cleanup interval would forward stale talk media
 	// after a short server-managed PTT lease has expired.
@@ -815,8 +1054,10 @@ func (s *server) cleanupLoop(timeout time.Duration) {
 		for channelId, ch := range s.channels {
 			releaseReasons := make(map[uint32]uint8)
 			for key, p := range ch.peers {
-				if now.Sub(p.lastSeen) > timeout {
+				if !p.membershipDeadline.IsZero() && !p.membershipDeadline.After(now) {
 					delete(ch.peers, key)
+					delete(ch.codecConfigs, p.senderId)
+					delete(ch.mediaCodecConfigs, p.senderId)
 					if _, ok := ch.activeTalkers[p.senderId]; ok {
 						delete(ch.activeTalkers, p.senderId)
 						releaseReasons[p.senderId] = talkReleaseMembershipTimeout
@@ -886,24 +1127,15 @@ func (s *server) logPacket(pkt parsedPacket, addr *net.UDPAddr, size int) {
 		extra)
 }
 
-func parseCodecConfigPayload(payload []byte) (pcmOnly bool, codecId uint8, mode uint16, ok bool) {
-	if len(payload) < 3 {
+func parseCodecConfigPayload(payload []byte) (pcmOnly bool, codecId uint8, mode uint32, ok bool) {
+	if len(payload) != 19 {
 		return false, 0, 0, false
 	}
 
 	flags := payload[0]
 	pcmOnly = (flags & 0x01) != 0
-
-	// Backward compatibility:
-	// old: [flags][mode_hi][mode_lo]
-	// new: [flags][codec_id][mode_hi][mode_lo]
-	if len(payload) >= 4 {
-		codecId = payload[1]
-		mode = binary.BigEndian.Uint16(payload[2:4])
-	} else {
-		codecId = 1 // codec2
-		mode = binary.BigEndian.Uint16(payload[1:3])
-	}
+	codecId = payload[1]
+	mode = binary.BigEndian.Uint32(payload[2:6])
 	if pcmOnly {
 		codecId = 0
 	}
@@ -1055,6 +1287,10 @@ func parsePacketPayload(data []byte, header packetHeader, sec securityHeader, pa
 }
 
 func buildControlPacket(pktType uint8, channelId uint32, senderId uint32, payload []byte, noCrypto bool) []byte {
+	return buildRelayControlPacket(pktType, channelId, senderId, payload, noCrypto, 0)
+}
+
+func buildRelayControlPacket(pktType uint8, channelId uint32, senderId uint32, payload []byte, noCrypto bool, sequence uint16) []byte {
 	header := make([]byte, fixedHeaderSize)
 	header[0] = protocolVersion
 	header[1] = pktType
@@ -1065,7 +1301,7 @@ func buildControlPacket(pktType uint8, channelId uint32, senderId uint32, payloa
 	binary.BigEndian.PutUint16(header[2:4], uint16(headerLen))
 	binary.BigEndian.PutUint32(header[4:8], channelId)
 	binary.BigEndian.PutUint32(header[8:12], senderId)
-	binary.BigEndian.PutUint16(header[12:14], 0)
+	binary.BigEndian.PutUint16(header[12:14], sequence)
 	binary.BigEndian.PutUint16(header[14:16], 0)
 
 	if noCrypto {
@@ -1109,7 +1345,25 @@ func talkReleasePayload(talkerId uint32, reason uint8) []byte {
 
 func main() {
 	port := flag.Int("port", 50000, "UDP listen port")
-	timeout := flag.Duration("timeout", 30*time.Second, "peer timeout")
+	membershipLeaseDefault := int(defaultMembershipLease / time.Second)
+	if raw := os.Getenv("INCOMUDON_MEMBERSHIP_LEASE_SEC"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			membershipLeaseDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_MEMBERSHIP_LEASE_SEC=%q (using %d)", raw, membershipLeaseDefault)
+		}
+	}
+	keepaliveIntervalDefault := int(defaultKeepaliveInterval / time.Second)
+	if raw := os.Getenv("INCOMUDON_KEEPALIVE_INTERVAL_SEC"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			keepaliveIntervalDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_KEEPALIVE_INTERVAL_SEC=%q (using %d)", raw, keepaliveIntervalDefault)
+		}
+	}
+	membershipLeaseSec := flag.Int("membership-lease-sec", membershipLeaseDefault, "membership lease in seconds (15..300)")
+	keepaliveIntervalSec := flag.Int("keepalive-interval-sec", keepaliveIntervalDefault, "idle keepalive interval in seconds (1..lease/3)")
+	legacyTimeout := flag.Duration("timeout", 0, "deprecated alias for -membership-lease-sec; use whole seconds")
 	talkMaxSecDefault := 0
 	if raw := os.Getenv("INCOMUDON_TALK_MAX_SEC"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
@@ -1181,6 +1435,18 @@ func main() {
 	logPackets := flag.Bool("log-packets", false, "log received packets")
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
 	flag.Parse()
+	timeoutExplicitlySet := false
+	flag.Visit(func(candidate *flag.Flag) {
+		if candidate.Name == "timeout" {
+			timeoutExplicitlySet = true
+		}
+	})
+	if timeoutExplicitlySet {
+		if *legacyTimeout <= 0 || *legacyTimeout%time.Second != 0 {
+			log.Fatal("-timeout must be a positive whole number of seconds; use -membership-lease-sec")
+		}
+		*membershipLeaseSec = int(*legacyTimeout / time.Second)
+	}
 
 	if *talkMaxSec < 0 {
 		*talkMaxSec = 0
@@ -1191,6 +1457,11 @@ func main() {
 	if *maxActiveTalkers > maxActiveTalkersV1 {
 		log.Printf("max-active-talkers=%d exceeds Version 1 limit; clamping to %d", *maxActiveTalkers, maxActiveTalkersV1)
 		*maxActiveTalkers = maxActiveTalkersV1
+	}
+	membershipLease := time.Duration(*membershipLeaseSec) * time.Second
+	keepaliveInterval := time.Duration(*keepaliveIntervalSec) * time.Second
+	if !validMembershipTiming(membershipLease, keepaliveInterval) {
+		log.Fatalf("invalid membership timing: lease must be 15..300 seconds and keepalive must be 1..floor(lease/3) seconds (got lease=%ds keepalive=%ds)", *membershipLeaseSec, *keepaliveIntervalSec)
 	}
 	talkMax := time.Duration(*talkMaxSec) * time.Second
 	controlPolicy, err := parseControlAuthPolicy(*controlAuthPolicyFlag)
@@ -1220,6 +1491,9 @@ func main() {
 	}
 	defer conn.Close()
 	srv := newServer(conn, *noCrypto, *logPackets, *logAudio, talkMax, *multiTalk, *maxActiveTalkers)
+	if err := srv.configureMembershipTiming(membershipLease, keepaliveInterval); err != nil {
+		log.Fatalf("invalid membership timing: %v", err)
+	}
 	srv.configureControlAuth(controlAuth)
 
 	directoryPublisher, err := newDirectoryPublisher(directoryPublisherConfig{
@@ -1257,11 +1531,11 @@ func main() {
 	if *noCrypto {
 		mode = "no-crypto"
 	}
-	log.Printf("IncomUdon relay listening on udp :%d (%s, control_auth=%s, talk_max=%ds, multi_talk=%t, max_active_talkers=%d)", *port, mode, controlPolicy, *talkMaxSec, *multiTalk, *maxActiveTalkers)
+	log.Printf("IncomUdon relay listening on udp :%d (%s, control_auth=%s, talk_max=%ds, membership_lease=%ds, keepalive_interval=%ds, multi_talk=%t, max_active_talkers=%d)", *port, mode, controlPolicy, *talkMaxSec, *membershipLeaseSec, *keepaliveIntervalSec, *multiTalk, *maxActiveTalkers)
 
 	if *logAudio {
 		*logPackets = true
 	}
-	go srv.cleanupLoop(*timeout)
+	go srv.cleanupLoop(membershipLease)
 	srv.run()
 }
