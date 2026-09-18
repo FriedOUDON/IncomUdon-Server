@@ -8,3 +8,5 @@ incomudon-server.exe
 /directory-v3/directory-keys.csv
 /control/control-keys.csv
 /control/cookie.secret
+/private-control/*
+!/private-control/services.csv.example

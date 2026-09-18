@@ -153,6 +153,7 @@ type server struct {
 	serviceAdmission    *serviceAdmissionState
 	directory           *directoryV3
 	management          *managementPlane
+	privateControl      *privateControlLink
 	floorInterrupt      bool
 	membershipLease     time.Duration
 	keepaliveInterval   time.Duration
@@ -431,12 +432,15 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 				admission, found := s.serviceAdmission.takeVerifiedAdmission(pkt, addr, meta, now)
 				if !found || !s.setPeerServiceAdmission(pkt.Header.ChannelId, pkt.Header.SenderId, addr, admission) {
 					s.sendAuthenticatedControl(addr, pkt.Header.ChannelId, pkt.Header.SenderId, meta.keyID, pktServiceDeny, []byte{serviceDenyInvalidProof})
+				} else {
+					s.publishManagementEvent("service_admission_issued", uint32Pointer(pkt.Header.ChannelId), uint32Pointer(pkt.Header.SenderId), stringPointer(admission.serviceID), nil, nil, nil)
 				}
 			}
 		}
 		return
 	}
 
+	var joinedServiceID *string
 	if pkt.Header.Type == pktJoin && requiresAuth {
 		meta, ok := s.verifyIncomingControl(pkt)
 		replay, ok := s.controlAuth.consumeJoinChallenge(pkt, addr, meta)
@@ -455,8 +459,14 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 		if !service.grantExpires.IsZero() && !s.setPeerServiceAdmission(pkt.Header.ChannelId, pkt.Header.SenderId, addr, service) {
 			return
 		}
+		if !service.grantExpires.IsZero() {
+			joinedServiceID = stringPointer(service.serviceID)
+		}
 		if !s.startMembership(pkt.Header.ChannelId, pkt.Header.SenderId, addr) {
 			return
+		}
+		if joinedServiceID != nil {
+			s.publishManagementEvent("service_admission_issued", uint32Pointer(pkt.Header.ChannelId), uint32Pointer(pkt.Header.SenderId), joinedServiceID, nil, nil, nil)
 		}
 	} else if pkt.Header.Type == pktJoin {
 		if len(pkt.Payload) != 0 {
@@ -494,7 +504,7 @@ func (s *server) handlePacket(pkt parsedPacket, addr *net.UDPAddr) {
 	switch pkt.Header.Type {
 	case pktJoin:
 		log.Printf("join ch=%d sender=%d from=%s", pkt.Header.ChannelId, pkt.Header.SenderId, addr.String())
-		s.publishManagementEvent("participant_joined", uint32Pointer(pkt.Header.ChannelId), uint32Pointer(pkt.Header.SenderId), nil, nil, nil, nil)
+		s.publishManagementEvent("participant_joined", uint32Pointer(pkt.Header.ChannelId), uint32Pointer(pkt.Header.SenderId), joinedServiceID, nil, nil, nil)
 		s.sendServerConfig(pkt.Header.ChannelId, pkt.Header.SenderId)
 		s.sendCurrentTalkState(pkt.Header.ChannelId, pkt.Header.SenderId)
 	case pktLeave:
@@ -1899,6 +1909,21 @@ func main() {
 		managementEventDeliveryDefault = string(managementEventDeliveryLive)
 	}
 	managementEventDeliveryFlag := flag.String("management-event-delivery", managementEventDeliveryDefault, "embedded Management Plane event delivery: live or disabled")
+	privateControlEnabledDefault := false
+	if raw := os.Getenv("INCOMUDON_PRIVATE_CONTROL_ENABLED"); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			privateControlEnabledDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_PRIVATE_CONTROL_ENABLED=%q (using false)", raw)
+		}
+	}
+	privateControlEnabled := flag.Bool("private-control-enabled", privateControlEnabledDefault, "enable the Private Control Link v1 mTLS listener")
+	privateControlListen := flag.String("private-control-listen", os.Getenv("INCOMUDON_PRIVATE_CONTROL_LISTEN"), "Private Control Link mTLS listen address")
+	privateControlCertificateFile := flag.String("private-control-cert-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_CERT_FILE"), "Private Control Link server certificate PEM file")
+	privateControlPrivateKeyFile := flag.String("private-control-key-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_KEY_FILE"), "Private Control Link server private key PEM file")
+	privateControlClientCAFile := flag.String("private-control-client-ca-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE"), "Private Control Link trusted client CA PEM file")
+	privateControlServicesCSV := flag.String("private-control-services-csv", os.Getenv("INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV"), "Private Control Link authorized services CSV")
+	privateControlRelayID := flag.String("private-control-relay-id", os.Getenv("INCOMUDON_PRIVATE_CONTROL_RELAY_ID"), "Private Control Link opaque Relay identifier")
 	floorInterruptDefault := false
 	if raw := os.Getenv("INCOMUDON_FLOOR_INTERRUPT_ENABLED"); raw != "" {
 		if parsed, err := strconv.ParseBool(raw); err == nil {
@@ -2050,6 +2075,19 @@ func main() {
 			log.Fatalf("invalid Management Plane configuration: %v", err)
 		}
 		log.Printf("Management Plane HTTPS listener enabled at %s", *managementListen)
+	}
+	if *privateControlEnabled {
+		if *managementEnabled && strings.TrimSpace(*privateControlListen) == strings.TrimSpace(*managementListen) {
+			log.Fatal("private-control-listen must be distinct from management-listen")
+		}
+		if _, err := startPrivateControlLink(srv, privateControlConfig{
+			listenAddress: *privateControlListen, certificateFile: *privateControlCertificateFile,
+			privateKeyFile: *privateControlPrivateKeyFile, clientCAFile: *privateControlClientCAFile,
+			servicesCSV: *privateControlServicesCSV, relayID: *privateControlRelayID,
+		}); err != nil {
+			log.Fatalf("invalid Private Control Link configuration: %v", err)
+		}
+		log.Printf("Private Control Link mTLS listener enabled at %s", *privateControlListen)
 	}
 
 	mode := "encrypted"

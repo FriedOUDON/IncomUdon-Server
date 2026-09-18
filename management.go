@@ -1044,6 +1044,9 @@ func (s *server) publishManagementEvent(eventType string, channelID *uint32, sen
 	if s.management != nil {
 		s.management.publishEvent(eventType, channelID, senderID, serviceID, jobID, state, reason)
 	}
+	if s.privateControl != nil {
+		s.privateControl.publishLifecycleEvent(eventType, channelID, senderID, serviceID, jobID, state, reason)
+	}
 }
 
 // revokeManagedServiceAdmission is the Relay-side target for a private,

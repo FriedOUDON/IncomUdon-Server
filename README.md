@@ -278,6 +278,51 @@ deployment that needs replay-capable SSE, Audit Retrieval, or durable
 recording/revocation integration must use an external Management Service behind
 the private management boundary.
 
+### Private Control Link Event Export
+
+The optional Private Control Link is a second, dedicated TLS 1.3 mTLS TCP
+listener for a Management Service. It is distinct from the Management Plane
+HTTPS API and **must** use a different listener address. Bind it only to a
+private administration network.
+
+This Relay's P1 profile implements outbound, live-only lifecycle export. A
+Management Service starts a `private-control-link-v1` session with `hello` and
+`want_lifecycle_events: true`; the Relay accepts that capability and sends a
+bounded, best-effort stream of redacted `relay_lifecycle_event` messages. The
+Relay does not retain, replay, or assign SSE cursor IDs to these events. A
+full queue drops the affected event rather than delaying media forwarding.
+The Management Service is responsible for any durable audit or SSE storage.
+
+P1 exports `participant_joined`, `participant_left`, `talk_started`,
+`talk_ended`, `service_admission_issued`, `service_admission_revoked`, and an
+initial `relay_health_changed` event. It does not yet implement inbound
+`revoke_service_admission` commands or `relay_audit_input`; `hello_ack`
+therefore reports `audit_inputs_accepted: false` and unsupported commands are
+rejected.
+
+Authorize mTLS client certificates with a separate strict CSV policy file:
+
+```csv
+management_service_id,certificate_sha256,enabled
+management-main,LOWERCASE_SHA256_OF_DER_CLIENT_CERTIFICATE,true
+```
+
+`certificate_sha256` is the lowercase SHA-256 digest of the complete DER
+client certificate. The `management_service_id` in the authenticated `hello`
+must match this certificate mapping. An example is available at
+`private-control/services.csv.example`.
+
+```bash
+INCOMUDON_PRIVATE_CONTROL_ENABLED=true \
+INCOMUDON_PRIVATE_CONTROL_LISTEN=127.0.0.1:9443 \
+INCOMUDON_PRIVATE_CONTROL_CERT_FILE=./private-control/server.crt \
+INCOMUDON_PRIVATE_CONTROL_KEY_FILE=./private-control/server.key \
+INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE=./private-control/client-ca.crt \
+INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV=./private-control/services.csv \
+INCOMUDON_PRIVATE_CONTROL_RELAY_ID=relay-production-east-1 \
+go run . -port 50000
+```
+
 ## Directory UDP
 
 This Relay implements optional Directory UDP v3. It is disabled by default and

@@ -1,15 +1,24 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -1589,5 +1598,249 @@ func TestManagedServiceRevocationRemovesMembership(t *testing.T) {
 		if _, found := channel.peers[peerMapKey(serviceAddr.LocalAddr().(*net.UDPAddr))]; found || s.isTalker(100, 9001) {
 			t.Fatal("revocation retained the managed service membership or active talker")
 		}
+	}
+}
+
+func newTestPrivateControlLink(t *testing.T, server *server) *privateControlLink {
+	t.Helper()
+	link, err := newPrivateControlLink(server, privateControlPolicy{byCertificate: map[string]string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "management-main",
+	}}, "relay-test")
+	if err != nil {
+		t.Fatalf("new private control link: %v", err)
+	}
+	return link
+}
+
+func TestPrivateControlExportsLifecycleEvents(t *testing.T) {
+	relay := newTestUDPConn(t)
+	server := newServer(relay, false, false, false, 0, false, 1)
+	link := newTestPrivateControlLink(t, server)
+	server.privateControl = link
+	session := &privateControlSession{
+		serviceID:       "management-main",
+		lifecycleEvents: true,
+		send:            make(chan any, 1),
+		done:            make(chan struct{}),
+	}
+	link.addSession(session)
+	t.Cleanup(func() { link.removeSession(session) })
+
+	server.publishManagementEvent("talk_started", uint32Pointer(100), uint32Pointer(9001), nil, nil, nil, nil)
+	message := <-session.send
+	event, ok := message.(privateControlLifecycleEvent)
+	if !ok {
+		t.Fatalf("lifecycle message type = %T", message)
+	}
+	if event.SchemaVersion != privateControlSchemaVersion || event.Type != privateControlLifecycleEventType || event.EventType != "talk_started" {
+		t.Fatalf("unexpected lifecycle event: %+v", event)
+	}
+	if event.ChannelID == nil || *event.ChannelID != 100 || event.SenderID == nil || *event.SenderID != 9001 {
+		t.Fatalf("lifecycle event routing fields = %+v", event)
+	}
+	if !validPrivateControlID(event.MessageID) {
+		t.Fatalf("lifecycle message_id is not canonical: %q", event.MessageID)
+	}
+	if _, err := time.Parse(time.RFC3339, event.OccurredAt); err != nil {
+		t.Fatalf("lifecycle occurred_at = %q: %v", event.OccurredAt, err)
+	}
+}
+
+func TestPrivateControlDropsInsteadOfBlockingLifecycleEvents(t *testing.T) {
+	relay := newTestUDPConn(t)
+	server := newServer(relay, false, false, false, 0, false, 1)
+	link := newTestPrivateControlLink(t, server)
+	server.privateControl = link
+	session := &privateControlSession{
+		serviceID:       "management-main",
+		lifecycleEvents: true,
+		send:            make(chan any, 1),
+		done:            make(chan struct{}),
+	}
+	link.addSession(session)
+	t.Cleanup(func() { link.removeSession(session) })
+
+	server.publishManagementEvent("talk_started", uint32Pointer(100), uint32Pointer(9001), nil, nil, nil, nil)
+	started := time.Now()
+	server.publishManagementEvent("talk_ended", uint32Pointer(100), uint32Pointer(9001), nil, nil, nil, stringPointer("CLIENT_PTT_OFF"))
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("full private control queue blocked Relay for %s", elapsed)
+	}
+	link.mu.Lock()
+	dropped := link.dropped
+	link.mu.Unlock()
+	if dropped != 1 {
+		t.Fatalf("dropped lifecycle events = %d, want 1", dropped)
+	}
+}
+
+func TestPrivateControlFrameValidation(t *testing.T) {
+	var frame bytes.Buffer
+	payload := []byte(`{"schema_version":"private-control-link-v1","schema_version":"private-control-link-v1"}`)
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(payload)))
+	frame.Write(length[:])
+	frame.Write(payload)
+	if _, err := readPrivateControlFrame(&frame); err == nil {
+		t.Fatal("duplicate JSON member was accepted")
+	}
+	if validPrivateControlID("AAAAAAAAAAAAAAAAAAAAAB") {
+		t.Fatal("noncanonical 16-byte Base64URL ID was accepted")
+	}
+}
+
+func TestPrivateControlPolicyRejectsDuplicateDisabledCertificate(t *testing.T) {
+	path := t.TempDir() + "/private-control-services.csv"
+	contents := "management_service_id,certificate_sha256,enabled\n" +
+		"management-main,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,true\n" +
+		"management-disabled,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,false\n"
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatalf("write policy CSV: %v", err)
+	}
+	if _, err := loadPrivateControlPolicy(path); err == nil {
+		t.Fatal("duplicate certificate digest was accepted")
+	}
+}
+
+func newPrivateControlTestTLSConfigs(t *testing.T) (*tls.Config, *tls.Config, string) {
+	t.Helper()
+	now := time.Now()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("create test CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create test CA certificate: %v", err)
+	}
+	caCertificate, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("parse test CA certificate: %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	serverCertificate, _ := newPrivateControlTestLeaf(t, caCertificate, caKey, 2, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []string{"relay.test"})
+	clientCertificate, clientDER := newPrivateControlTestLeaf(t, caCertificate, caKey, 3, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		t.Fatal("append test CA")
+	}
+	serverConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{serverCertificate},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    roots,
+	}
+	clientConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{clientCertificate},
+		RootCAs:      roots,
+		ServerName:   "relay.test",
+	}
+	digest := sha256.Sum256(clientDER)
+	return serverConfig, clientConfig, hex.EncodeToString(digest[:])
+}
+
+func newPrivateControlTestLeaf(t *testing.T, issuer *x509.Certificate, issuerKey *ecdsa.PrivateKey, serial int64, usages []x509.ExtKeyUsage, dnsNames []string) (tls.Certificate, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("create test leaf key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(serial),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  usages,
+		DNSNames:     dnsNames,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, issuer, &key.PublicKey, issuerKey)
+	if err != nil {
+		t.Fatalf("create test leaf certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal test leaf key: %v", err)
+	}
+	certificate, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
+	)
+	if err != nil {
+		t.Fatalf("load test leaf key pair: %v", err)
+	}
+	return certificate, der
+}
+
+func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
+	relay := newTestUDPConn(t)
+	server := newServer(relay, false, false, false, 0, false, 1)
+	serverConfig, clientConfig, clientDigest := newPrivateControlTestTLSConfigs(t)
+	link, err := newPrivateControlLink(server, privateControlPolicy{byCertificate: map[string]string{clientDigest: "management-main"}}, "relay-test")
+	if err != nil {
+		t.Fatalf("new private control link: %v", err)
+	}
+	serverRaw, clientRaw := net.Pipe()
+	finished := make(chan struct{})
+	go func() {
+		link.handleConnection(tls.Server(serverRaw, serverConfig))
+		close(finished)
+	}()
+	client := tls.Client(clientRaw, clientConfig)
+	t.Cleanup(func() {
+		_ = client.Close()
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			t.Error("private control connection did not close")
+		}
+	})
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client TLS handshake: %v", err)
+	}
+	helloID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatalf("hello ID: %v", err)
+	}
+	wantEvents, wantAuditInputs := true, true
+	if err := writePrivateControlFrame(client, privateControlHello{
+		SchemaVersion:       privateControlSchemaVersion,
+		Type:                "hello",
+		MessageID:           helloID,
+		ManagementServiceID: "management-main",
+		WantLifecycleEvents: &wantEvents,
+		WantAuditInputs:     &wantAuditInputs,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	rawAck, err := readPrivateControlFrame(client)
+	if err != nil {
+		t.Fatalf("read hello_ack: %v", err)
+	}
+	var ack privateControlHelloAck
+	if err := decodePrivateControlJSON(rawAck, &ack); err != nil {
+		t.Fatalf("decode hello_ack: %v", err)
+	}
+	if ack.Type != "hello_ack" || ack.InReplyTo != helloID || ack.RelayID != "relay-test" || !ack.LifecycleEventsAccepted || ack.AuditInputsAccepted {
+		t.Fatalf("unexpected hello_ack: %+v", ack)
+	}
+	rawHealth, err := readPrivateControlFrame(client)
+	if err != nil {
+		t.Fatalf("read initial health event: %v", err)
+	}
+	var health privateControlLifecycleEvent
+	if err := decodePrivateControlJSON(rawHealth, &health); err != nil {
+		t.Fatalf("decode initial health event: %v", err)
+	}
+	if health.Type != privateControlLifecycleEventType || health.EventType != "relay_health_changed" || health.ChannelID != nil || health.State == nil || *health.State != "healthy" {
+		t.Fatalf("unexpected initial health event: %+v", health)
 	}
 }

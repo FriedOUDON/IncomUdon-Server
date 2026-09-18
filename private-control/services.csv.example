@@ -1,0 +1,2 @@
+management_service_id,certificate_sha256,enabled
+management-main,LOWERCASE_SHA256_OF_DER_CLIENT_CERTIFICATE,true
