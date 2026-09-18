@@ -187,9 +187,6 @@ func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool,
 		membershipLease:   defaultMembershipLease,
 		keepaliveInterval: defaultKeepaliveInterval,
 	}
-	// Retain redacted audit data even when the optional HTTPS Management Plane
-	// listener is disabled. Enabling the listener later promotes this sink.
-	server.management = newManagementAuditSink(server)
 	return server
 }
 
@@ -1025,16 +1022,12 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	requester := ch.peers[peerMapKey(addr)]
 	if requester == nil || requester.senderId != senderId || requester.membershipDeadline.IsZero() || !requester.membershipDeadline.After(now) ||
 		!peerAllowsInterrupt(requester, now) {
-		priority := peerAdmissionPriority(requester, now)
 		s.mu.Unlock()
-		s.auditFloorInterrupt(channelId, requester, priority, "denied", nil, nil)
 		s.denyPttRequest(channelId, senderId)
 		return false
 	}
 	if _, active := ch.activeTalkers[senderId]; active {
-		priority := peerInterruptPriority(requester, now)
 		s.mu.Unlock()
-		s.auditFloorInterrupt(channelId, requester, priority, "success", nil, nil)
 		s.sendRelayControlTo(channelId, senderId, pktTalkGrant, senderId, talkPayload(senderId))
 		return true
 	}
@@ -1048,9 +1041,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	}
 	if len(ch.activeTalkers) < limit {
 		ch.activeTalkers[senderId] = now
-		priority := peerInterruptPriority(requester, now)
 		s.mu.Unlock()
-		s.auditFloorInterrupt(channelId, requester, priority, "success", nil, nil)
 		s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
 		s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
 		return true
@@ -1069,7 +1060,6 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	if victim == 0 || requesterPriority <= victimPriority {
 		current := firstActiveTalker(ch)
 		s.mu.Unlock()
-		s.auditFloorInterrupt(channelId, requester, requesterPriority, "denied", nil, nil)
 		s.sendRelayControlTo(channelId, senderId, pktTalkDeny, current, talkPayload(current))
 		return true
 	}
@@ -1081,7 +1071,6 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	// old media. Receivers still must tolerate UDP reordering.
 	s.broadcastRelayControl(channelId, pktTalkRelease, victim, talkReleasePayload(victim, talkReleasePreempted))
 	s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
-	s.auditFloorInterrupt(channelId, requester, requesterPriority, "success", uint32Pointer(victim), uint8Pointer(victimPriority))
 	s.publishManagementEvent("talk_ended", uint32Pointer(channelId), uint32Pointer(victim), nil, nil, nil, stringPointer("PREEMPTED"))
 	s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
 	return true
@@ -1905,6 +1894,11 @@ func main() {
 	managementChannelACLCSV := flag.String("management-channel-acl-csv", os.Getenv("INCOMUDON_MANAGEMENT_CHANNEL_ACL_CSV"), "Management Plane channel ACL CSV")
 	managementGlobalPermissionsCSV := flag.String("management-global-permissions-csv", os.Getenv("INCOMUDON_MANAGEMENT_GLOBAL_PERMISSIONS_CSV"), "Management Plane explicit global permissions CSV")
 	managementSigningKeyFile := flag.String("management-signing-key-file", os.Getenv("INCOMUDON_MANAGEMENT_SIGNING_KEY_FILE"), "Management Plane Ed25519 private signing key CSV")
+	managementEventDeliveryDefault := os.Getenv("INCOMUDON_MANAGEMENT_EVENT_DELIVERY")
+	if managementEventDeliveryDefault == "" {
+		managementEventDeliveryDefault = string(managementEventDeliveryLive)
+	}
+	managementEventDeliveryFlag := flag.String("management-event-delivery", managementEventDeliveryDefault, "embedded Management Plane event delivery: live or disabled")
 	floorInterruptDefault := false
 	if raw := os.Getenv("INCOMUDON_FLOOR_INTERRUPT_ENABLED"); raw != "" {
 		if parsed, err := strconv.ParseBool(raw); err == nil {
@@ -1993,7 +1987,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid managed service admission configuration: %v", err)
 	}
-
 	addr := &net.UDPAddr{Port: *port}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
@@ -2044,11 +2037,15 @@ func main() {
 		log.Printf("Directory UDP v3 enabled transport=%s", directoryTransport)
 	}
 	if *managementEnabled {
+		managementEventDelivery, err := parseManagementEventDelivery(*managementEventDeliveryFlag)
+		if err != nil {
+			log.Fatalf("invalid embedded Management Plane event delivery: %v", err)
+		}
 		if _, err := startManagementPlane(srv, managementPlaneConfig{
 			listenAddress: *managementListen, certificateFile: *managementCertificateFile, privateKeyFile: *managementPrivateKeyFile,
 			clientCAFile: *managementClientCAFile, servicesCSV: *managementServicesCSV, channelACLCSV: *managementChannelACLCSV,
 			globalPermissionsCSV: *managementGlobalPermissionsCSV, signingKeyFile: *managementSigningKeyFile,
-			issuer: *serviceAdmissionIssuer, audience: *serviceAdmissionAudience,
+			issuer: *serviceAdmissionIssuer, audience: *serviceAdmissionAudience, eventDelivery: managementEventDelivery,
 		}); err != nil {
 			log.Fatalf("invalid Management Plane configuration: %v", err)
 		}

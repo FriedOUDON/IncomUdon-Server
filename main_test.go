@@ -1441,7 +1441,7 @@ func newTestManagementPlane(t *testing.T, server *server, apiRole string) (*mana
 			},
 		},
 	}
-	plane, err := newManagementPlane(server, policy, managementGrantSigner{keyID: "management-test-key", key: privateKey}, "https://management.example.test", "relay-test")
+	plane, err := newManagementPlane(server, policy, managementGrantSigner{keyID: "management-test-key", key: privateKey}, "https://management.example.test", "relay-test", managementEventDeliveryLive)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1475,48 +1475,63 @@ func TestManagementPlaneIssuesVerifiableServiceGrant(t *testing.T) {
 	}
 }
 
-func TestManagementAuditRetrievalEnforcesScopeAndPaginates(t *testing.T) {
+func TestEmbeddedManagementPlaneDisablesAuditRetrieval(t *testing.T) {
 	relay := newTestUDPConn(t)
 	s := newServer(relay, false, false, false, 0, false, 1)
 	plane, service, _ := newTestManagementPlane(t, s, "auditor")
-	plane.appendAudit(managementAuditRecord{ActorType: "service", ActorID: "controller", ChannelID: uint32Pointer(100), Action: "recording_start", Result: "success", RecordingJob: &managementRecordingJobAudit{JobID: "job-1", RecorderServiceID: "recorder-01"}})
-	plane.appendAudit(managementAuditRecord{ActorType: "identity", ActorID: "identity-redacted", ChannelID: uint32Pointer(100), Action: "floor_interrupt", Result: "denied", FloorInterrupt: &managementFloorInterruptAudit{RequesterPriority: 10}})
-
-	request := httptest.NewRequest(http.MethodGet, "/v1/audit-records?channel_id=100&limit=1", nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/audit-records", nil)
 	response := httptest.NewRecorder()
 	plane.handleAuditRecords(response, request, service)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("disabled audit retrieval status = %d", response.Code)
+	}
+}
+
+func TestEmbeddedManagementPlaneAdvertisesLiveOnlyCapabilities(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, service, _ := newTestManagementPlane(t, s, "viewer")
+	service.global["health.read"] = true
+	response := httptest.NewRecorder()
+	plane.handleHealth(response, httptest.NewRequest(http.MethodGet, "/v1/health", nil), service)
 	if response.Code != http.StatusOK {
-		t.Fatalf("first audit page status = %d: %s", response.Code, response.Body.String())
+		t.Fatalf("health status = %d", response.Code)
 	}
-	var page struct {
-		SchemaVersion string                  `json:"schema_version"`
-		Records       []managementAuditRecord `json:"records"`
-		NextCursor    *string                 `json:"next_cursor"`
+	var health struct {
+		Status       string `json:"status"`
+		Capabilities struct {
+			EventDelivery  string `json:"event_delivery"`
+			AuditRetrieval bool   `json:"audit_retrieval"`
+		} `json:"capabilities"`
 	}
-	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil {
 		t.Fatal(err)
 	}
-	if page.SchemaVersion != "audit-retrieval-v1" || len(page.Records) != 1 || page.NextCursor == nil || page.Records[0].Action != "floor_interrupt" {
-		t.Fatalf("first audit page = %+v", page)
-	}
-	request = httptest.NewRequest(http.MethodGet, "/v1/audit-records?channel_id=100&limit=1&cursor="+*page.NextCursor, nil)
-	response = httptest.NewRecorder()
-	plane.handleAuditRecords(response, request, service)
-	if response.Code != http.StatusOK {
-		t.Fatalf("second audit page status = %d", response.Code)
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Records) != 1 || page.Records[0].Action != "recording_start" || page.NextCursor != nil {
-		t.Fatalf("second audit page = %+v", page)
+	if health.Status != "healthy" || health.Capabilities.EventDelivery != "live" || health.Capabilities.AuditRetrieval {
+		t.Fatalf("unexpected health capabilities: %+v", health)
 	}
 
-	request = httptest.NewRequest(http.MethodGet, "/v1/audit-records?channel_id=101", nil)
+	plane.publishEvent("talk_started", uint32Pointer(100), uint32Pointer(9001), nil, nil, nil, nil)
+	plane.appendAudit(managementAuditRecord{ActorType: "service", ActorID: "controller", ChannelID: uint32Pointer(100), Action: "recording_start", Result: "success"})
+	if len(plane.events) != 0 || len(plane.audit) != 0 {
+		t.Fatalf("live-only plane retained events=%d audits=%d", len(plane.events), len(plane.audit))
+	}
+}
+
+func TestEmbeddedManagementPlaneRejectsCursorsAndCanDisableEvents(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, service, _ := newTestManagementPlane(t, s, "viewer")
+	response := httptest.NewRecorder()
+	plane.handleEvents(response, httptest.NewRequest(http.MethodGet, "/v1/events?since=1", nil), service)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("live cursor status = %d", response.Code)
+	}
+	plane.eventDelivery = managementEventDeliveryDisabled
 	response = httptest.NewRecorder()
-	plane.handleAuditRecords(response, request, service)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("unauthorized audit channel status = %d", response.Code)
+	plane.handleEvents(response, httptest.NewRequest(http.MethodGet, "/v1/events", nil), service)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("disabled event status = %d", response.Code)
 	}
 }
 
@@ -1536,20 +1551,11 @@ func TestManagementEventAuthorizationScopes(t *testing.T) {
 	}
 }
 
-func TestFloorInterruptUsesDefaultRedactedAuditSink(t *testing.T) {
+func TestNewServerDoesNotCreateManagementRetentionSink(t *testing.T) {
 	relay := newTestUDPConn(t)
 	s := newServer(relay, false, false, false, 0, false, 1)
-	if s.management == nil {
-		t.Fatal("new Relay has no default audit sink")
-	}
-	priority := uint8(200)
-	s.auditFloorInterrupt(100, &peer{identityAdmission: &identityAdmission{actorIDHash: [16]byte{1}, expiresAt: time.Now().Add(time.Minute), priority: priority}}, priority, "denied", nil, nil)
-	if len(s.management.audit) != 1 {
-		t.Fatalf("default audit sink records = %d", len(s.management.audit))
-	}
-	record := s.management.audit[0]
-	if record.Action != "floor_interrupt" || record.Result != "denied" || record.FloorInterrupt == nil || record.FloorInterrupt.RequesterPriority != priority || record.FloorInterrupt.ReplacedSenderID != nil || record.FloorInterrupt.ReplacedPriority != nil {
-		t.Fatalf("default audit record = %+v", record)
+	if s.management != nil {
+		t.Fatal("new Relay unexpectedly created a Management retention sink")
 	}
 }
 

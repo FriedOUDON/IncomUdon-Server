@@ -27,10 +27,28 @@ import (
 )
 
 const (
-	managementEventRetention = 4096
 	managementAuditRetention = 10000
 	managementGrantLifetime  = 5 * time.Minute
 )
+
+type managementEventDelivery string
+
+const (
+	managementEventDeliveryDisabled managementEventDelivery = "disabled"
+	managementEventDeliveryLive     managementEventDelivery = "live"
+)
+
+func parseManagementEventDelivery(value string) (managementEventDelivery, error) {
+	parsed := managementEventDelivery(strings.ToLower(strings.TrimSpace(value)))
+	switch parsed {
+	case managementEventDeliveryDisabled, managementEventDeliveryLive:
+		return parsed, nil
+	case "replay":
+		return "", errors.New("replay requires an external Management Service with durable event storage")
+	default:
+		return "", errors.New("must be live or disabled")
+	}
+}
 
 type managementService struct {
 	serviceID string
@@ -73,6 +91,7 @@ type managementPlaneConfig struct {
 	signingKeyFile       string
 	issuer               string
 	audience             string
+	eventDelivery        managementEventDelivery
 }
 
 type managementEvent struct {
@@ -125,21 +144,23 @@ type managementSubscriber struct {
 }
 
 type managementPlane struct {
-	mu          sync.Mutex
-	server      *server
-	policy      managementPolicy
-	signer      managementGrantSigner
-	issuer      string
-	audience    string
-	events      []managementEvent
-	eventNext   uint64
-	subscribers map[uint64]managementSubscriber
-	subscriberN uint64
-	audit       []managementAuditRecord
-	auditNext   uint64
-	jobs        map[string]managementRecordingJob
-	jobNext     uint64
-	cursorKey   [32]byte
+	mu             sync.Mutex
+	server         *server
+	policy         managementPolicy
+	signer         managementGrantSigner
+	issuer         string
+	audience       string
+	eventDelivery  managementEventDelivery
+	auditRetrieval bool
+	events         []managementEvent
+	eventNext      uint64
+	subscribers    map[uint64]managementSubscriber
+	subscriberN    uint64
+	audit          []managementAuditRecord
+	auditNext      uint64
+	jobs           map[string]managementRecordingJob
+	jobNext        uint64
+	cursorKey      [32]byte
 }
 
 var managementServiceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -338,35 +359,14 @@ func loadManagementGrantSigner(path string) (managementGrantSigner, error) {
 	return managementGrantSigner{keyID: rows[0][0], key: privateKey}, nil
 }
 
-func newManagementPlane(server *server, policy managementPolicy, signer managementGrantSigner, issuer string, audience string) (*managementPlane, error) {
-	if server == nil || len(signer.key) != ed25519.PrivateKeySize || strings.TrimSpace(issuer) == "" || strings.TrimSpace(audience) == "" {
+func newManagementPlane(server *server, policy managementPolicy, signer managementGrantSigner, issuer string, audience string, eventDelivery managementEventDelivery) (*managementPlane, error) {
+	if server == nil || len(signer.key) != ed25519.PrivateKeySize || strings.TrimSpace(issuer) == "" || strings.TrimSpace(audience) == "" || (eventDelivery != managementEventDeliveryLive && eventDelivery != managementEventDeliveryDisabled) {
 		return nil, errors.New("invalid management plane configuration")
 	}
-	plane := &managementPlane{server: server, policy: policy, signer: signer, issuer: issuer, audience: audience, subscribers: make(map[uint64]managementSubscriber), jobs: make(map[string]managementRecordingJob)}
-	if _, err := rand.Read(plane.cursorKey[:]); err != nil {
-		return nil, fmt.Errorf("generate management cursor key: %w", err)
-	}
-	return plane, nil
-}
-
-func newManagementAuditSink(server *server) *managementPlane {
-	plane := &managementPlane{server: server, subscribers: make(map[uint64]managementSubscriber), jobs: make(map[string]managementRecordingJob)}
-	// The cursor key is unused until a configured HTTPS listener replaces this
-	// private in-process sink. Keep the sink available even on RNG failure.
-	_, _ = rand.Read(plane.cursorKey[:])
-	return plane
-}
-
-func (p *managementPlane) copyRetainedDataFrom(previous *managementPlane) {
-	if p == nil || previous == nil || p == previous {
-		return
-	}
-	previous.mu.Lock()
-	defer previous.mu.Unlock()
-	p.events = append(p.events, previous.events...)
-	p.eventNext = previous.eventNext
-	p.audit = append(p.audit, previous.audit...)
-	p.auditNext = previous.auditNext
+	// The embedded listener intentionally does not offer Audit Retrieval, so it
+	// has no audit cursor or durable-retention setup. Those features belong to
+	// an external Management Service.
+	return &managementPlane{server: server, policy: policy, signer: signer, issuer: issuer, audience: audience, eventDelivery: eventDelivery, subscribers: make(map[uint64]managementSubscriber), jobs: make(map[string]managementRecordingJob)}, nil
 }
 
 func startManagementPlane(server *server, config managementPlaneConfig) (*managementPlane, error) {
@@ -400,11 +400,10 @@ func startManagementPlane(server *server, config managementPlaneConfig) (*manage
 	if !clientCAs.AppendCertsFromPEM(caData) {
 		return nil, errors.New("management client CA contains no certificates")
 	}
-	plane, err := newManagementPlane(server, policy, signer, config.issuer, config.audience)
+	plane, err := newManagementPlane(server, policy, signer, config.issuer, config.audience, config.eventDelivery)
 	if err != nil {
 		return nil, err
 	}
-	plane.copyRetainedDataFrom(server.management)
 	server.management = plane
 	httpServer := &http.Server{
 		Addr:              config.listenAddress,
@@ -508,13 +507,12 @@ func (p *managementPlane) eventAllowed(service *managementService, event managem
 }
 
 func (p *managementPlane) publishEvent(eventType string, channelID *uint32, senderID *uint32, serviceID *string, jobID *string, state *string, reason *string) {
+	if p.eventDelivery != managementEventDeliveryLive {
+		return
+	}
 	p.mu.Lock()
 	p.eventNext++
 	event := managementEvent{SchemaVersion: "management-event-v1", EventID: strconv.FormatUint(p.eventNext, 10), OccurredAt: time.Now().UTC().Format(time.RFC3339), Type: eventType, ChannelID: channelID, SenderID: senderID, ServiceID: serviceID, RecordingJobID: jobID, State: state, Reason: reason}
-	p.events = append(p.events, event)
-	if len(p.events) > managementEventRetention {
-		p.events = append([]managementEvent(nil), p.events[len(p.events)-managementEventRetention:]...)
-	}
 	subscribers := make([]managementSubscriber, 0, len(p.subscribers))
 	for _, subscriber := range p.subscribers {
 		subscribers = append(subscribers, subscriber)
@@ -531,6 +529,9 @@ func (p *managementPlane) publishEvent(eventType string, channelID *uint32, send
 }
 
 func (p *managementPlane) appendAudit(record managementAuditRecord) {
+	if !p.auditRetrieval {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.auditNext++
@@ -550,7 +551,13 @@ func (p *managementPlane) handleHealth(w http.ResponseWriter, r *http.Request, s
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	writeManagementJSON(w, http.StatusOK, map[string]string{"status": "healthy"})
+	writeManagementJSON(w, http.StatusOK, map[string]any{
+		"status": "healthy",
+		"capabilities": map[string]any{
+			"event_delivery":  p.eventDelivery,
+			"audit_retrieval": p.auditRetrieval,
+		},
+	})
 }
 
 func (p *managementPlane) handleChannels(w http.ResponseWriter, r *http.Request, service *managementService) {
@@ -610,24 +617,17 @@ func (p *managementPlane) handleParticipants(w http.ResponseWriter, r *http.Requ
 	writeManagementJSON(w, http.StatusOK, map[string]any{"channel_id": channelID, "participants": participants})
 }
 
-func (p *managementPlane) selectedEventCursor(r *http.Request) (uint64, bool, int) {
-	value := r.Header.Get("Last-Event-ID")
-	if value == "" {
-		value = r.URL.Query().Get("since")
-	}
-	if value == "" {
-		return 0, false, 0
-	}
-	parsed, err := strconv.ParseUint(value, 10, 64)
-	if err != nil || parsed == 0 || strconv.FormatUint(parsed, 10) != value {
-		return 0, true, http.StatusBadRequest
-	}
-	return parsed, true, 0
-}
-
 func (p *managementPlane) handleEvents(w http.ResponseWriter, r *http.Request, service *managementService) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if p.eventDelivery == managementEventDeliveryDisabled {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get("Last-Event-ID") != "" || r.URL.Query().Get("since") != "" {
+		http.Error(w, "event cursors are unavailable for live delivery", http.StatusBadRequest)
 		return
 	}
 	p.mu.Lock()
@@ -637,35 +637,7 @@ func (p *managementPlane) handleEvents(w http.ResponseWriter, r *http.Request, s
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	cursor, selected, status := p.selectedEventCursor(r)
-	if status != 0 {
-		http.Error(w, "invalid cursor", status)
-		return
-	}
 	p.mu.Lock()
-	if selected {
-		found := false
-		for _, event := range p.events {
-			if event.EventID == strconv.FormatUint(cursor, 10) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			p.mu.Unlock()
-			http.Error(w, "cursor gone", http.StatusGone)
-			return
-		}
-	}
-	replay := make([]managementEvent, 0)
-	if selected {
-		for _, event := range p.events {
-			id, _ := strconv.ParseUint(event.EventID, 10, 64)
-			if id > cursor {
-				replay = append(replay, event)
-			}
-		}
-	}
 	p.subscriberN++
 	subscriberID := p.subscriberN
 	subscriber := managementSubscriber{service: service, ch: make(chan managementEvent, 64)}
@@ -684,11 +656,6 @@ func (p *managementPlane) handleEvents(w http.ResponseWriter, r *http.Request, s
 	if !ok {
 		http.Error(w, "streaming unavailable", http.StatusInternalServerError)
 		return
-	}
-	for _, event := range replay {
-		if p.eventAllowed(service, event) {
-			writeManagementSSE(w, event)
-		}
 	}
 	flusher.Flush()
 	for {
@@ -843,6 +810,10 @@ func recordMatchesAuditFilter(record managementAuditRecord, filter managementAud
 }
 
 func (p *managementPlane) handleAuditRecords(w http.ResponseWriter, r *http.Request, service *managementService) {
+	if !p.auditRetrieval {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet || service.apiRole != "auditor" {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -1073,32 +1044,6 @@ func (s *server) publishManagementEvent(eventType string, channelID *uint32, sen
 	if s.management != nil {
 		s.management.publishEvent(eventType, channelID, senderID, serviceID, jobID, state, reason)
 	}
-}
-
-func managementAdmissionActor(peer *peer) (string, string, bool) {
-	if peer == nil {
-		return "", "", false
-	}
-	if peer.identityAdmission != nil {
-		return "identity", base64.RawURLEncoding.EncodeToString(peer.identityAdmission.actorIDHash[:]), true
-	}
-	if peer.serviceAdmission != nil {
-		return "service", peer.serviceAdmission.serviceID, true
-	}
-	return "", "", false
-}
-
-func (s *server) auditFloorInterrupt(channelID uint32, requester *peer, priority uint8, result string, replacedSenderID *uint32, replacedPriority *uint8) {
-	if s.management == nil {
-		return
-	}
-	s.mu.Lock()
-	actorType, actorID, ok := managementAdmissionActor(requester)
-	s.mu.Unlock()
-	if !ok {
-		return
-	}
-	s.management.appendAudit(managementAuditRecord{ActorType: actorType, ActorID: actorID, ChannelID: uint32Pointer(channelID), Action: "floor_interrupt", Result: result, FloorInterrupt: &managementFloorInterruptAudit{RequesterPriority: priority, ReplacedSenderID: replacedSenderID, ReplacedPriority: replacedPriority}})
 }
 
 // revokeManagedServiceAdmission is the Relay-side target for a private,

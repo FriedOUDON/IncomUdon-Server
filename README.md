@@ -269,11 +269,14 @@ INCOMUDON_MANAGEMENT_SIGNING_KEY_FILE=./management/signing-key.csv \
 go run . -port 50000
 ```
 
-The Relay retains redacted audit/event history in a bounded in-memory sink for
-the process lifetime; the enabled Management Plane exposes the retained audit
-records and events subject to its mTLS ACLs. A production deployment should
-place durable audit or revocation integration behind its private management
-boundary.
+The embedded Relay listener advertises `event_delivery: "live"` by default and
+`audit_retrieval: false`. It sends redacted SSE events only to currently
+connected authorized subscribers, does not retain replay history, rejects SSE
+cursors, and returns `404` for `/v1/audit-records`. Set
+`INCOMUDON_MANAGEMENT_EVENT_DELIVERY=disabled` to omit SSE entirely. A
+deployment that needs replay-capable SSE, Audit Retrieval, or durable
+recording/revocation integration must use an external Management Service behind
+the private management boundary.
 
 ## Directory UDP
 
