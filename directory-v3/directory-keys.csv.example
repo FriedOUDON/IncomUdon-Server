@@ -1,0 +1,4 @@
+# This is a public test-vector value. Generate a distinct key for every
+# production channel and protect the resulting file as a secret.
+channel_id,directory_channel_key_base64url
+111,F0IJ2nWqJbT5FzQgcWWcLk0VobOzj9gvrYPVGcMs8X4

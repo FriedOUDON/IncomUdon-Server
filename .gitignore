@@ -3,5 +3,8 @@ incomudon-server.exe
 /directory/channels.csv
 /directory/speakers.csv
 /directory/directory.psk
+/directory-v3/channels.csv
+/directory-v3/speakers.csv
+/directory-v3/directory-keys.csv
 /control/control-keys.csv
 /control/cookie.secret

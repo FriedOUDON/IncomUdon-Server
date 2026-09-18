@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,7 +19,7 @@ import (
 const (
 	protocolVersion                    = 1
 	fixedHeaderSize                    = 16
-	legacySecurityHeaderSize           = 12
+	securityHeaderExtensionSize        = 12
 	aesGCMV2MediaHeaderSize            = 20
 	aesGCMV2HeaderSize                 = fixedHeaderSize + aesGCMV2MediaHeaderSize
 	authTagSize                        = 16
@@ -148,6 +151,7 @@ type server struct {
 	controlAuth         *controlAuthState
 	identityAdmission   *identityAdmissionState
 	serviceAdmission    *serviceAdmissionState
+	directory           *directoryV3
 	management          *managementPlane
 	floorInterrupt      bool
 	membershipLease     time.Duration
@@ -202,6 +206,10 @@ func (s *server) configureServiceAdmission(state *serviceAdmissionState) {
 	s.serviceAdmission = state
 }
 
+func (s *server) configureDirectory(directory *directoryV3) {
+	s.directory = directory
+}
+
 func validMembershipTiming(lease time.Duration, keepalive time.Duration) bool {
 	if lease < minimumMembershipLease || lease > maximumMembershipLease ||
 		lease%time.Second != 0 || keepalive < minimumKeepaliveInterval ||
@@ -230,49 +238,32 @@ func (s *server) nextRelaySequence() uint16 {
 	return sequence
 }
 
-// directoryParticipants returns the relay's current peer view without exposing
-// endpoint addresses. The directory publisher owns serialization and encrypts
-// this data before it leaves the relay process.
-func (s *server) directoryParticipants() []directoryParticipant {
+func (s *server) directoryParticipants(channelID uint32) []directoryParticipantRow {
 	if s == nil {
 		return nil
 	}
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	now := time.Now()
-	byIdentity := make(map[[2]uint32]directoryParticipant)
-	for channelID, ch := range s.channels {
-		for _, peer := range ch.peers {
-			if peer == nil || peer.senderId == 0 || peer.lastSeen.Before(now.Add(-directoryMaxValidity)) {
-				continue
-			}
-			key := [2]uint32{channelID, peer.senderId}
-			candidate := directoryParticipant{
-				ChannelID:  channelID,
-				SenderID:   peer.senderId,
-				LastSeenAt: peer.lastSeen.Unix(),
-				Talking:    false,
-			}
-			if _, active := ch.activeTalkers[peer.senderId]; active {
-				candidate.Talking = true
-			}
-			if previous, exists := byIdentity[key]; !exists || candidate.LastSeenAt > previous.LastSeenAt {
-				byIdentity[key] = candidate
-			}
-		}
+	ch := s.channels[channelID]
+	if ch == nil {
+		return nil
 	}
-
-	participants := make([]directoryParticipant, 0, len(byIdentity))
-	for _, participant := range byIdentity {
-		participants = append(participants, participant)
-	}
-	sort.Slice(participants, func(i, j int) bool {
-		if participants[i].ChannelID != participants[j].ChannelID {
-			return participants[i].ChannelID < participants[j].ChannelID
+	participants := make([]directoryParticipantRow, 0, len(ch.peers))
+	for _, peer := range ch.peers {
+		if peer == nil || peer.senderId == 0 || (!peer.membershipDeadline.IsZero() && !peer.membershipDeadline.After(now)) {
+			continue
 		}
-		return participants[i].SenderID < participants[j].SenderID
-	})
+		lastSeen := peer.lastSeen.Unix()
+		if lastSeen < 1 {
+			continue
+		}
+		_, talking := ch.activeTalkers[peer.senderId]
+		participants = append(participants, directoryParticipantRow{
+			ChannelID: channelID, SenderID: peer.senderId, LastSeenAt: uint64(lastSeen), Talking: talking,
+		})
+	}
+	sort.Slice(participants, func(i, j int) bool { return participants[i].SenderID < participants[j].SenderID })
 	return participants
 }
 
@@ -283,6 +274,9 @@ func (s *server) run() {
 	for {
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			log.Printf("read error: %v", err)
 			continue
 		}
@@ -293,6 +287,15 @@ func (s *server) run() {
 			if s.logPackets {
 				log.Printf("udp_datagram_drop reason=oversize size=%d max=%d from=%s", n, maxUDPDatagramBytes, addr)
 			}
+			continue
+		}
+		if len(data) >= len(directoryCarrierMagic) && bytes.Equal(data[:len(directoryCarrierMagic)], directoryCarrierMagic) {
+			if s.directory != nil && s.directory.transport == directoryTransportMediaPort &&
+				len(data) >= len(directoryCarrierMagic)+1 && data[len(directoryCarrierMagic)] == directoryCarrierVersion {
+				s.directory.enqueue(data[len(directoryCarrierMagic)+1:], addr, directoryTransportMedia)
+			}
+			// A Directory carrier is never interpreted as binary media/control.
+			// Disabled and dedicated-UDP configurations discard it without reply.
 			continue
 		}
 
@@ -1673,15 +1676,15 @@ func parsePacket(data []byte, noCrypto bool) (parsedPacket, bool) {
 		return parsePacketPayload(data, header, sec, aesGCMV2HeaderSize)
 	}
 
-	if header.HeaderLen == fixedHeaderSize+legacySecurityHeaderSize {
-		if len(data) < fixedHeaderSize+legacySecurityHeaderSize+authTagSize {
+	if header.HeaderLen == fixedHeaderSize+securityHeaderExtensionSize {
+		if len(data) < fixedHeaderSize+securityHeaderExtensionSize+authTagSize {
 			return parsedPacket{}, false
 		}
 		sec := securityHeader{
 			ControlNonce: binary.BigEndian.Uint64(data[16:24]),
 			KeyID:        binary.BigEndian.Uint32(data[24:28]),
 		}
-		return parsePacketPayload(data, header, sec, fixedHeaderSize+legacySecurityHeaderSize)
+		return parsePacketPayload(data, header, sec, fixedHeaderSize+securityHeaderExtensionSize)
 	}
 
 	if header.HeaderLen != fixedHeaderSize || !noCrypto {
@@ -1711,7 +1714,7 @@ func buildRelayControlPacket(pktType uint8, channelId uint32, senderId uint32, p
 	header[1] = pktType
 	headerLen := fixedHeaderSize
 	if !noCrypto {
-		headerLen = fixedHeaderSize + legacySecurityHeaderSize
+		headerLen = fixedHeaderSize + securityHeaderExtensionSize
 	}
 	binary.BigEndian.PutUint16(header[2:4], uint16(headerLen))
 	binary.BigEndian.PutUint32(header[4:8], channelId)
@@ -1726,7 +1729,7 @@ func buildRelayControlPacket(pktType uint8, channelId uint32, senderId uint32, p
 		return packet
 	}
 
-	sec := make([]byte, legacySecurityHeaderSize)
+	sec := make([]byte, securityHeaderExtensionSize)
 	tag := make([]byte, authTagSize)
 
 	packet := make([]byte, 0, len(header)+len(sec)+len(payload)+len(tag))
@@ -1803,7 +1806,6 @@ func main() {
 	}
 	membershipLeaseSec := flag.Int("membership-lease-sec", membershipLeaseDefault, "membership lease in seconds (15..300)")
 	keepaliveIntervalSec := flag.Int("keepalive-interval-sec", keepaliveIntervalDefault, "idle keepalive interval in seconds (1..lease/3)")
-	legacyTimeout := flag.Duration("timeout", 0, "deprecated alias for -membership-lease-sec; use whole seconds")
 	talkMaxSecDefault := 0
 	if raw := os.Getenv("INCOMUDON_TALK_MAX_SEC"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
@@ -1839,31 +1841,30 @@ func main() {
 			log.Printf("invalid INCOMUDON_DIRECTORY_ENABLED=%q (using false)", raw)
 		}
 	}
-	directoryEnabled := flag.Bool("directory-enabled", directoryEnabledDefault, "enable Directory publishing and pull requests")
-	directoryDynamicClientsDefault := false
-	if raw := os.Getenv("INCOMUDON_DIRECTORY_DYNAMIC_CLIENTS_ENABLED"); raw != "" {
-		if parsed, err := strconv.ParseBool(raw); err == nil {
-			directoryDynamicClientsDefault = parsed
+	directoryEnabled := flag.Bool("directory-enabled", directoryEnabledDefault, "enable Directory UDP v3")
+	directoryTransportFlag := flag.String("directory-transport", os.Getenv("INCOMUDON_DIRECTORY_TRANSPORT"), "Directory UDP transport: media-port or dedicated-udp")
+	directoryKeyFile := flag.String("directory-key-file", os.Getenv("INCOMUDON_DIRECTORY_KEY_FILE"), "CSV file containing channel_id,directory_channel_key_base64url")
+	directoryChannelsCSV := flag.String("directory-channels-csv", os.Getenv("INCOMUDON_DIRECTORY_CHANNELS_CSV"), "CSV file containing channel_id,name")
+	directorySpeakersCSV := flag.String("directory-speakers-csv", os.Getenv("INCOMUDON_DIRECTORY_SPEAKERS_CSV"), "CSV file containing channel_id,sender_id,name")
+	directoryDedicatedListen := flag.String("directory-dedicated-listen", os.Getenv("INCOMUDON_DIRECTORY_DEDICATED_LISTEN"), "Directory UDP v3 dedicated listener address")
+	directoryPublishDefault := directoryDefaultPublishInterval
+	if raw := os.Getenv("INCOMUDON_DIRECTORY_PUBLISH_INTERVAL"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil {
+			directoryPublishDefault = parsed
 		} else {
-			log.Printf("invalid INCOMUDON_DIRECTORY_DYNAMIC_CLIENTS_ENABLED=%q (using false)", raw)
+			log.Printf("invalid INCOMUDON_DIRECTORY_PUBLISH_INTERVAL=%q (using %s)", raw, directoryPublishDefault)
 		}
 	}
-	directoryDynamicClients := flag.Bool("directory-dynamic-clients", directoryDynamicClientsDefault, "accept authenticated PWA/native directory client registrations")
-	directoryChannelsCSV := flag.String("directory-channels-csv", os.Getenv("INCOMUDON_DIRECTORY_CHANNELS_CSV"), "CSV file containing channel_id,name for Directory publishing")
-	directorySpeakersCSV := flag.String("directory-speakers-csv", os.Getenv("INCOMUDON_DIRECTORY_SPEAKERS_CSV"), "CSV file containing channel_id,sender_id,name for Directory publishing")
-	directoryUDPTarget := flag.String("directory-udp-target", os.Getenv("INCOMUDON_DIRECTORY_UDP_TARGET"), "PWA UDP target for PSK directory snapshots")
-	directoryUDPListenDefault := os.Getenv("INCOMUDON_DIRECTORY_UDP_LISTEN")
-	if directoryUDPListenDefault == "" {
-		directoryUDPListenDefault = ":51000"
+	directoryFreshnessDefault := directoryDefaultFreshnessTTL
+	if raw := os.Getenv("INCOMUDON_DIRECTORY_FRESHNESS_TTL"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil {
+			directoryFreshnessDefault = parsed
+		} else {
+			log.Printf("invalid INCOMUDON_DIRECTORY_FRESHNESS_TTL=%q (using %s)", raw, directoryFreshnessDefault)
+		}
 	}
-	directoryUDPListen := flag.String("directory-udp-listen", directoryUDPListenDefault, "UDP listen address for authenticated directory pull requests")
-	directoryPSKFile := flag.String("directory-psk-file", os.Getenv("INCOMUDON_DIRECTORY_PSK_FILE"), "path to base64url directory PSK file")
-	directoryKeyID := flag.String("directory-key-id", os.Getenv("INCOMUDON_DIRECTORY_KEY_ID"), "directory PSK recipient key ID (default pwa-1)")
-	directoryRequestAllowCIDRs := flag.String("directory-request-allow-cidrs", os.Getenv("INCOMUDON_DIRECTORY_REQUEST_ALLOW_CIDRS"), "optional comma-separated source CIDRs allowed to request directory snapshots")
-	directoryClientAllowCIDRs := flag.String("directory-client-allow-cidrs", os.Getenv("INCOMUDON_DIRECTORY_CLIENT_ALLOW_CIDRS"), "optional comma-separated source CIDRs allowed to register dynamic directory clients")
-	directoryPublishInterval := flag.Duration("directory-publish-interval", directoryDurationFromEnv("INCOMUDON_DIRECTORY_PUBLISH_INTERVAL", directoryDefaultInterval), "directory snapshot publish interval")
-	directoryTTL := flag.Duration("directory-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_TTL", directoryDefaultTTL), "directory snapshot validity")
-	directoryClientTTL := flag.Duration("directory-client-ttl", directoryDurationFromEnv("INCOMUDON_DIRECTORY_CLIENT_TTL", directoryDefaultClientTTL), "dynamic directory client registration validity")
+	directoryPublishInterval := flag.Duration("directory-publish-interval", directoryPublishDefault, "Directory UDP v3 participant publication interval (1s..)")
+	directoryFreshnessTTL := flag.Duration("directory-freshness-ttl", directoryFreshnessDefault, "Directory UDP v3 response freshness TTL (1s..90s)")
 	controlAuthPolicyDefault := os.Getenv("INCOMUDON_CONTROL_AUTH_POLICY")
 	if controlAuthPolicyDefault == "" {
 		controlAuthPolicyDefault = string(controlAuthOff)
@@ -1917,18 +1918,6 @@ func main() {
 	logPackets := flag.Bool("log-packets", false, "log received packets")
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
 	flag.Parse()
-	timeoutExplicitlySet := false
-	flag.Visit(func(candidate *flag.Flag) {
-		if candidate.Name == "timeout" {
-			timeoutExplicitlySet = true
-		}
-	})
-	if timeoutExplicitlySet {
-		if *legacyTimeout <= 0 || *legacyTimeout%time.Second != 0 {
-			log.Fatal("-timeout must be a positive whole number of seconds; use -membership-lease-sec")
-		}
-		*membershipLeaseSec = int(*legacyTimeout / time.Second)
-	}
 
 	if *talkMaxSec < 0 {
 		*talkMaxSec = 0
@@ -2018,6 +2007,42 @@ func main() {
 	srv.configureControlAuth(controlAuth)
 	srv.configureIdentityAdmission(identityAdmission, *floorInterrupt)
 	srv.configureServiceAdmission(serviceAdmission)
+	if *directoryEnabled {
+		directoryTransport, err := parseDirectoryTransport(*directoryTransportFlag)
+		if err != nil {
+			log.Fatalf("invalid Directory UDP transport: %v", err)
+		}
+		directoryConn := conn
+		if directoryTransport == directoryTransportDedicatedUDP {
+			if strings.TrimSpace(*directoryDedicatedListen) == "" {
+				log.Fatal("-directory-dedicated-listen is required for directory-transport=dedicated-udp")
+			}
+			directoryAddr, err := net.ResolveUDPAddr("udp", *directoryDedicatedListen)
+			if err != nil {
+				log.Fatalf("invalid Directory UDP dedicated listener: %v", err)
+			}
+			directoryConn, err = net.ListenUDP("udp", directoryAddr)
+			if err != nil {
+				log.Fatalf("Directory UDP dedicated listen error: %v", err)
+			}
+		}
+		directory, err := newDirectoryV3(directoryV3Config{
+			Enabled: *directoryEnabled, Transport: directoryTransport, KeyFile: *directoryKeyFile,
+			ChannelsCSV: *directoryChannelsCSV, SpeakersCSV: *directorySpeakersCSV, Conn: directoryConn,
+			PublishInterval: *directoryPublishInterval, FreshnessTTL: *directoryFreshnessTTL,
+			Participants: srv.directoryParticipants,
+		})
+		if err != nil {
+			if directoryConn != conn {
+				_ = directoryConn.Close()
+			}
+			log.Fatalf("invalid Directory UDP v3 configuration: %v", err)
+		}
+		srv.configureDirectory(directory)
+		defer directory.close()
+		directory.start()
+		log.Printf("Directory UDP v3 enabled transport=%s", directoryTransport)
+	}
 	if *managementEnabled {
 		if _, err := startManagementPlane(srv, managementPlaneConfig{
 			listenAddress: *managementListen, certificateFile: *managementCertificateFile, privateKeyFile: *managementPrivateKeyFile,
@@ -2028,37 +2053,6 @@ func main() {
 			log.Fatalf("invalid Management Plane configuration: %v", err)
 		}
 		log.Printf("Management Plane HTTPS listener enabled at %s", *managementListen)
-	}
-
-	directoryPublisher, err := newDirectoryPublisher(directoryPublisherConfig{
-		Enabled:           *directoryEnabled,
-		ChannelsCSV:       *directoryChannelsCSV,
-		SpeakersCSV:       *directorySpeakersCSV,
-		Target:            *directoryUDPTarget,
-		ListenAddress:     *directoryUDPListen,
-		PSKFile:           *directoryPSKFile,
-		KeyID:             *directoryKeyID,
-		Interval:          *directoryPublishInterval,
-		TTL:               *directoryTTL,
-		RequestAllowCIDRs: *directoryRequestAllowCIDRs,
-		DynamicClients:    *directoryDynamicClients,
-		ClientTTL:         *directoryClientTTL,
-		ClientAllowCIDRs:  *directoryClientAllowCIDRs,
-		Participants:      srv.directoryParticipants,
-	})
-	if err != nil {
-		log.Fatalf("invalid directory publishing configuration: %v", err)
-	}
-	if directoryPublisher != nil {
-		defer directoryPublisher.Close()
-		log.Printf("PSK directory enabled: target=%s listen=%s interval=%s ttl=%s dynamic_clients=%t client_ttl=%s", *directoryUDPTarget, *directoryUDPListen, *directoryPublishInterval, *directoryTTL, *directoryDynamicClients, *directoryClientTTL)
-		if len(directoryPublisher.allowed) == 0 {
-			log.Printf("PSK directory request source CIDR filtering is disabled; configure -directory-request-allow-cidrs to reduce unauthenticated UDP load")
-		}
-		if *directoryDynamicClients && len(directoryPublisher.clientAllowed) == 0 {
-			log.Printf("PSK directory dynamic client source CIDR filtering is disabled; configure -directory-client-allow-cidrs to reduce unauthenticated UDP load")
-		}
-		go directoryPublisher.Run()
 	}
 
 	mode := "encrypted"

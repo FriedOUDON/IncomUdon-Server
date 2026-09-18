@@ -67,8 +67,7 @@ JOIN.
 
 Only accepted `KEEPALIVE`, `CODEC_CONFIG`, PTT control, and authorized active
 `AUDIO`/`FEC` refresh membership. `PING`/`PONG` are RTT probes and never extend
-the membership deadline. `-timeout` remains a deprecated whole-second alias
-for `-membership-lease-sec`.
+the membership deadline.
 
 ## Simultaneous transmit (multi-talk)
 
@@ -276,10 +275,50 @@ records and events subject to its mTLS ACLs. A production deployment should
 place durable audit or revocation integration behind its private management
 boundary.
 
-## Directory Provisioning
+## Directory UDP
 
-For PSK-protected channel and speaker name provisioning to a PWA server, see
-[directory.md](directory.md).
+This Relay implements optional Directory UDP v3. It is disabled by default and
+supports only the current v3 wire format; the removed v1 shared-PSK and v2
+formats are neither accepted nor transmitted.
+
+When enabled, the default `media-port` transport uses the Relay UDP port and
+the authenticated `IDP3 || 0x01 || JSON` carrier. Directory processing has
+bounded worker, request, and response budgets, so it is best effort and cannot
+delay media or ordinary control packets. No extra Docker port is required for
+this default transport.
+
+Each configured channel requires static metadata and a Relay-local
+`directory_channel_key`:
+
+```text
+directory-v3/directory-keys.csv
+channel_id,directory_channel_key_base64url
+111,<canonical-unpadded-base64url-32-byte-key>
+```
+
+The key is the 32-byte `directory_channel_key` derived from the channel's
+`password_key` using `HKDF-SHA-256` with info
+`incomudon-directory-channel-v3`. Provision this derived key through an
+offline credential-management workflow. The Relay deliberately does not accept
+raw channel credentials or `password_key` values for Directory configuration.
+Use `directory-v3/channels.csv.example`,
+`directory-v3/speakers.csv.example`, and
+`directory-v3/directory-keys.csv.example` as format references; keep the real
+key file outside version control.
+
+```bash
+INCOMUDON_DIRECTORY_ENABLED=true \
+INCOMUDON_DIRECTORY_KEY_FILE=./directory-v3/directory-keys.csv \
+INCOMUDON_DIRECTORY_CHANNELS_CSV=./directory-v3/channels.csv \
+INCOMUDON_DIRECTORY_SPEAKERS_CSV=./directory-v3/speakers.csv \
+go run . -port 50000
+```
+
+For operationally isolated Directory traffic, select
+`INCOMUDON_DIRECTORY_TRANSPORT=dedicated-udp` and set
+`INCOMUDON_DIRECTORY_DEDICATED_LISTEN`, for example `:51000`. The dedicated
+listener carries raw v3 JSON and must be exposed explicitly by the deployment;
+the default `compose.yaml` intentionally does not publish that optional port.
 
 ## Docker Compose
 
