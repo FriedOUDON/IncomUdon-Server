@@ -157,6 +157,43 @@ INCOMUDON_CONTROL_COOKIE_SECRET_FILE=/run/incomudon-control/cookie.secret
 packets with `sender_id = 0` are rejected before they can create membership,
 talk, or authentication state; zero remains reserved for Relay/System packets.
 
+### Secret file handling
+
+All Relay configuration directories in `compose.yaml` and
+`compose.management.yaml` are bind-mounted read-only. The Relay also checks
+the private inputs it reads: Control Authentication keys and cookie secret,
+Directory channel-key CSV, Management Plane signing/TLS private keys, and
+Private Control Link TLS private key.
+
+`INCOMUDON_SECRET_FILE_PERMISSIONS` (or `-secret-file-permissions`) controls
+the startup check:
+
+- `required` (the Compose default): on Unix, the path must be a regular file,
+  owner-readable, and have no group or other permissions. Use `0400` or
+  `0600`.
+- `warn`: log a validation failure and continue. Use only for local
+  development when the platform cannot expose POSIX permissions.
+- `off`: disable the check; intended only for tests or explicitly accepted
+  legacy environments.
+
+The container runs as UID/GID `10001`. On Linux hosts, make the secret
+directories private and give this account ownership before starting Compose:
+
+```bash
+install -d -m 0700 -o 10001 -g 10001 control directory-v3 management private-control
+chown 10001:10001 control/control-keys.csv control/cookie.secret \
+  directory-v3/directory-keys.csv management/signing-key.csv management/server.key \
+  private-control/server.key
+chmod 0600 control/control-keys.csv control/cookie.secret \
+  directory-v3/directory-keys.csv management/signing-key.csv management/server.key \
+  private-control/server.key
+```
+
+Docker Desktop bind mounts on Windows do not reliably preserve Unix mode bits.
+For local Windows development, set `INCOMUDON_SECRET_FILE_PERMISSIONS=warn`.
+Production deployments should run on a Linux host or use a secret-delivery
+mechanism that preserves the equivalent ownership and access restrictions.
+
 ## Identity Admission and Floor Interrupt
 
 Identity Admission v1 verifies compact Ed25519-signed admission tickets from

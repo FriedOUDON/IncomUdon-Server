@@ -10,6 +10,7 @@ services:
       INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV: "/run/incomudon-private-control/services.csv"
       INCOMUDON_PRIVATE_CONTROL_RELAY_ID: "${INCOMUDON_PRIVATE_CONTROL_RELAY_ID:-relay-local}"
     volumes:
+      # The Relay can read, but cannot alter, Private Control Link credentials.
       - "${INCOMUDON_PRIVATE_CONTROL_DATA_DIR:-./private-control}:/run/incomudon-private-control:ro"
     expose:
       - "9443"
@@ -29,6 +30,7 @@ services:
       INCOMUDON_MANAGEMENT_PCL_RELAY_CA_FILE: "/run/incomudon-management-pcl/relay-ca.crt"
       INCOMUDON_MANAGEMENT_HTTP_LISTEN: ":8080"
     volumes:
+      # Management client credentials are likewise read-only in the container.
       - "${INCOMUDON_MANAGEMENT_PCL_DATA_DIR:-./management-pcl}:/run/incomudon-management-pcl:ro"
     expose:
       - "8080"

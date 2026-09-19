@@ -92,6 +92,7 @@ type managementPlaneConfig struct {
 	issuer               string
 	audience             string
 	eventDelivery        managementEventDelivery
+	secretPermissions    secretFilePermissionPolicy
 }
 
 type managementEvent struct {
@@ -335,7 +336,10 @@ func loadManagementPolicy(servicesPath string, aclPath string, globalPermissions
 	return policy, nil
 }
 
-func loadManagementGrantSigner(path string) (managementGrantSigner, error) {
+func loadManagementGrantSigner(path string, secretPermissions secretFilePermissionPolicy) (managementGrantSigner, error) {
+	if err := validateSecretFilePermissions(path, "Management Plane signing key", secretPermissions); err != nil {
+		return managementGrantSigner{}, err
+	}
 	rows, err := strictCSVRows(path, []string{"kid", "ed25519_private_key_base64"})
 	if err != nil {
 		return managementGrantSigner{}, fmt.Errorf("management signing key: %w", err)
@@ -377,7 +381,7 @@ func startManagementPlane(server *server, config managementPlaneConfig) (*manage
 	if err != nil {
 		return nil, err
 	}
-	signer, err := loadManagementGrantSigner(config.signingKeyFile)
+	signer, err := loadManagementGrantSigner(config.signingKeyFile, config.secretPermissions)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +391,9 @@ func startManagementPlane(server *server, config managementPlaneConfig) (*manage
 	verificationKey := server.serviceAdmission.keys[signer.keyID]
 	if len(verificationKey) != ed25519.PublicKeySize || !bytes.Equal(verificationKey, signer.key.Public().(ed25519.PublicKey)) {
 		return nil, errors.New("management signing key is not configured as a managed-service verification key")
+	}
+	if err := validateSecretFilePermissions(config.privateKeyFile, "Management Plane TLS private key", config.secretPermissions); err != nil {
+		return nil, err
 	}
 	certificate, err := tls.LoadX509KeyPair(config.certificateFile, config.privateKeyFile)
 	if err != nil {

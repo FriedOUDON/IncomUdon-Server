@@ -121,7 +121,7 @@ func TestLoadDirectoryKeyStore(t *testing.T) {
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	keys, err := loadDirectoryKeyStore(path)
+	keys, err := loadDirectoryKeyStore(path, secretFilePermissionsOff)
 	if err != nil {
 		t.Fatalf("loadDirectoryKeyStore: %v", err)
 	}

@@ -43,12 +43,13 @@ const (
 )
 
 type privateControlConfig struct {
-	listenAddress   string
-	certificateFile string
-	privateKeyFile  string
-	clientCAFile    string
-	servicesCSV     string
-	relayID         string
+	listenAddress     string
+	certificateFile   string
+	privateKeyFile    string
+	clientCAFile      string
+	servicesCSV       string
+	relayID           string
+	secretPermissions secretFilePermissionPolicy
 }
 
 type privateControlPolicy struct {
@@ -702,6 +703,9 @@ func newPrivateControlLifecycleEvent(eventType string, channelID *uint32, sender
 }
 
 func (l *privateControlLink) startListener(config privateControlConfig) error {
+	if err := validateSecretFilePermissions(config.privateKeyFile, "Private Control Link TLS private key", config.secretPermissions); err != nil {
+		return err
+	}
 	certificate, err := tls.LoadX509KeyPair(config.certificateFile, config.privateKeyFile)
 	if err != nil {
 		return fmt.Errorf("load private control server certificate: %w", err)

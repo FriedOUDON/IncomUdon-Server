@@ -1904,6 +1904,7 @@ func main() {
 	controlAuthPolicyFlag := flag.String("control-auth-policy", controlAuthPolicyDefault, "control authentication policy: off, optional, or required")
 	controlKeyFile := flag.String("control-key-file", os.Getenv("INCOMUDON_CONTROL_KEY_FILE"), "CSV file containing channel_id,key_id,control_key_base64")
 	controlCookieSecretFile := flag.String("control-cookie-secret-file", os.Getenv("INCOMUDON_CONTROL_COOKIE_SECRET_FILE"), "file containing the Relay control cookie secret")
+	secretFilePermissionsFlag := flag.String("secret-file-permissions", os.Getenv("INCOMUDON_SECRET_FILE_PERMISSIONS"), "secret file permission policy: required, warn, or off")
 	identityAdmissionModeDefault := os.Getenv("INCOMUDON_IDENTITY_ADMISSION_MODE")
 	if identityAdmissionModeDefault == "" {
 		identityAdmissionModeDefault = string(identityAdmissionOff)
@@ -1994,11 +1995,15 @@ func main() {
 	if *noCrypto && controlPolicy == controlAuthRequired {
 		log.Fatal("-no-crypto cannot be used with required control authentication")
 	}
-	controlKeys, err := loadControlKeyStore(*controlKeyFile)
+	secretPermissions, err := parseSecretFilePermissionPolicy(*secretFilePermissionsFlag)
+	if err != nil {
+		log.Fatalf("invalid secret file permission policy: %v", err)
+	}
+	controlKeys, err := loadControlKeyStore(*controlKeyFile, secretPermissions)
 	if err != nil {
 		log.Fatalf("invalid control key configuration: %v", err)
 	}
-	cookieSecret, err := loadCookieSecret(*controlCookieSecretFile)
+	cookieSecret, err := loadCookieSecret(*controlCookieSecretFile, secretPermissions)
 	if err != nil {
 		log.Fatalf("invalid control cookie secret: %v", err)
 	}
@@ -2081,7 +2086,7 @@ func main() {
 			Enabled: *directoryEnabled, Transport: directoryTransport, KeyFile: *directoryKeyFile,
 			ChannelsCSV: *directoryChannelsCSV, SpeakersCSV: *directorySpeakersCSV, Conn: directoryConn,
 			PublishInterval: *directoryPublishInterval, FreshnessTTL: *directoryFreshnessTTL,
-			Participants: srv.directoryParticipants,
+			Participants: srv.directoryParticipants, SecretPermissions: secretPermissions,
 		})
 		if err != nil {
 			if directoryConn != conn {
@@ -2104,6 +2109,7 @@ func main() {
 			clientCAFile: *managementClientCAFile, servicesCSV: *managementServicesCSV, channelACLCSV: *managementChannelACLCSV,
 			globalPermissionsCSV: *managementGlobalPermissionsCSV, signingKeyFile: *managementSigningKeyFile,
 			issuer: *serviceAdmissionIssuer, audience: *serviceAdmissionAudience, eventDelivery: managementEventDelivery,
+			secretPermissions: secretPermissions,
 		}); err != nil {
 			log.Fatalf("invalid Management Plane configuration: %v", err)
 		}
@@ -2116,7 +2122,7 @@ func main() {
 		if _, err := startPrivateControlLink(srv, privateControlConfig{
 			listenAddress: *privateControlListen, certificateFile: *privateControlCertificateFile,
 			privateKeyFile: *privateControlPrivateKeyFile, clientCAFile: *privateControlClientCAFile,
-			servicesCSV: *privateControlServicesCSV, relayID: *privateControlRelayID,
+			servicesCSV: *privateControlServicesCSV, relayID: *privateControlRelayID, secretPermissions: secretPermissions,
 		}); err != nil {
 			log.Fatalf("invalid Private Control Link configuration: %v", err)
 		}

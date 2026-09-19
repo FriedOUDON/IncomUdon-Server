@@ -125,10 +125,13 @@ func parseControlAuthPolicy(value string) (controlAuthPolicy, error) {
 	}
 }
 
-func loadControlKeyStore(path string) (controlKeyStore, error) {
+func loadControlKeyStore(path string, secretPermissions secretFilePermissionPolicy) (controlKeyStore, error) {
 	keys := make(controlKeyStore)
 	if strings.TrimSpace(path) == "" {
 		return keys, nil
+	}
+	if err := validateSecretFilePermissions(path, "control key file", secretPermissions); err != nil {
+		return nil, err
 	}
 
 	file, err := os.Open(path)
@@ -188,9 +191,12 @@ func parseUint32(value string) (uint32, error) {
 	return uint32(parsed), nil
 }
 
-func loadCookieSecret(path string) ([]byte, error) {
+func loadCookieSecret(path string, secretPermissions secretFilePermissionPolicy) ([]byte, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, nil
+	}
+	if err := validateSecretFilePermissions(path, "control cookie secret", secretPermissions); err != nil {
+		return nil, err
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

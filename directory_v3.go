@@ -135,9 +135,12 @@ func hkdfSHA256(ikm, salt, info []byte, length int) ([]byte, error) {
 	return output, nil
 }
 
-func loadDirectoryKeyStore(path string) (directoryKeyStore, error) {
+func loadDirectoryKeyStore(path string, secretPermissions secretFilePermissionPolicy) (directoryKeyStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("directory key file is required")
+	}
+	if err := validateSecretFilePermissions(path, "Directory key file", secretPermissions); err != nil {
+		return nil, err
 	}
 	rows, err := readDirectoryCSV(path)
 	if err != nil {
@@ -738,15 +741,16 @@ func (s *directoryReplayState) accept(sequence uint64) bool {
 }
 
 type directoryV3Config struct {
-	Enabled         bool
-	Transport       directoryTransport
-	KeyFile         string
-	ChannelsCSV     string
-	SpeakersCSV     string
-	Conn            *net.UDPConn
-	PublishInterval time.Duration
-	FreshnessTTL    time.Duration
-	Participants    func(uint32) []directoryParticipantRow
+	Enabled           bool
+	Transport         directoryTransport
+	KeyFile           string
+	ChannelsCSV       string
+	SpeakersCSV       string
+	Conn              *net.UDPConn
+	PublishInterval   time.Duration
+	FreshnessTTL      time.Duration
+	Participants      func(uint32) []directoryParticipantRow
+	SecretPermissions secretFilePermissionPolicy
 }
 
 type directoryRegistrationKey struct {
@@ -826,7 +830,7 @@ func newDirectoryV3(config directoryV3Config) (*directoryV3, error) {
 	if config.PublishInterval < time.Second || config.FreshnessTTL < time.Second || config.FreshnessTTL > directoryMaxFreshnessTTL {
 		return nil, fmt.Errorf("invalid Directory timing publish_interval=%s freshness_ttl=%s", config.PublishInterval, config.FreshnessTTL)
 	}
-	keys, err := loadDirectoryKeyStore(config.KeyFile)
+	keys, err := loadDirectoryKeyStore(config.KeyFile, config.SecretPermissions)
 	if err != nil {
 		return nil, err
 	}
