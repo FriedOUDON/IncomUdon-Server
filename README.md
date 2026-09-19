@@ -323,6 +323,52 @@ INCOMUDON_PRIVATE_CONTROL_RELAY_ID=relay-production-east-1 \
 go run . -port 50000
 ```
 
+### Bundled Management Service Container
+
+`compose.management.yaml` starts the separately built Management Service image
+alongside the Relay, while keeping the source repositories and container
+privileges separate. It enables the Relay's Private Control Link and connects
+the two containers only through an internal Docker network. The Relay's UDP
+media port remains the only port published by the base Compose file.
+
+The initial Management Service image is a P1 live-event consumer with internal
+health endpoints; it is not yet the full external Management Plane API. It
+does not persist, replay, or expose the received events outside the internal
+network.
+
+Prepare two distinct credential directories before starting the overlay:
+
+```text
+private-control/                 # mounted only into Relay
+  server.crt
+  server.key
+  client-ca.crt
+  services.csv
+
+management-pcl/                  # mounted only into Management Service
+  client.crt
+  client.key
+  relay-ca.crt
+```
+
+The certificate presented by the Management Service must chain to
+`private-control/client-ca.crt`; its DER SHA-256 fingerprint maps to the same
+`INCOMUDON_MANAGEMENT_PCL_SERVICE_ID` in `private-control/services.csv`. The
+Relay server certificate must contain `relay` (or the configured
+`INCOMUDON_MANAGEMENT_PCL_SERVER_NAME`) as a DNS SAN.
+
+After copying the required configuration from `.env.example`, start both
+containers together:
+
+```bash
+docker compose -f compose.yaml -f compose.management.yaml up -d
+```
+
+The default image is the Management repository's `main` image. Set
+`INCOMUDON_MANAGEMENT_IMAGE` to a released tag before production deployment.
+The Management Service reconnects with backoff, so Compose start order is not
+used as a readiness guarantee.
+
 ## Directory UDP
 
 This Relay implements optional Directory UDP v3. It is disabled by default and

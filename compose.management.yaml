@@ -1,0 +1,43 @@
+services:
+  relay:
+    environment:
+      INCOMUDON_MANAGEMENT_ENABLED: "false"
+      INCOMUDON_PRIVATE_CONTROL_ENABLED: "true"
+      INCOMUDON_PRIVATE_CONTROL_LISTEN: "${INCOMUDON_PRIVATE_CONTROL_LISTEN:-:9443}"
+      INCOMUDON_PRIVATE_CONTROL_CERT_FILE: "/run/incomudon-private-control/server.crt"
+      INCOMUDON_PRIVATE_CONTROL_KEY_FILE: "/run/incomudon-private-control/server.key"
+      INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE: "/run/incomudon-private-control/client-ca.crt"
+      INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV: "/run/incomudon-private-control/services.csv"
+      INCOMUDON_PRIVATE_CONTROL_RELAY_ID: "${INCOMUDON_PRIVATE_CONTROL_RELAY_ID:-relay-local}"
+    volumes:
+      - "${INCOMUDON_PRIVATE_CONTROL_DATA_DIR:-./private-control}:/run/incomudon-private-control:ro"
+    expose:
+      - "9443"
+    networks:
+      - default
+      - management
+
+  management:
+    image: "${INCOMUDON_MANAGEMENT_IMAGE:-ghcr.io/friedoudon/incomudon-management:main}"
+    restart: unless-stopped
+    environment:
+      INCOMUDON_MANAGEMENT_PCL_RELAY_ADDRESS: "relay:9443"
+      INCOMUDON_MANAGEMENT_PCL_SERVER_NAME: "${INCOMUDON_MANAGEMENT_PCL_SERVER_NAME:-relay}"
+      INCOMUDON_MANAGEMENT_PCL_SERVICE_ID: "${INCOMUDON_MANAGEMENT_PCL_SERVICE_ID:-management-main}"
+      INCOMUDON_MANAGEMENT_PCL_CERT_FILE: "/run/incomudon-management-pcl/client.crt"
+      INCOMUDON_MANAGEMENT_PCL_KEY_FILE: "/run/incomudon-management-pcl/client.key"
+      INCOMUDON_MANAGEMENT_PCL_RELAY_CA_FILE: "/run/incomudon-management-pcl/relay-ca.crt"
+      INCOMUDON_MANAGEMENT_HTTP_LISTEN: ":8080"
+    volumes:
+      - "${INCOMUDON_MANAGEMENT_PCL_DATA_DIR:-./management-pcl}:/run/incomudon-management-pcl:ro"
+    expose:
+      - "8080"
+    depends_on:
+      relay:
+        condition: service_started
+    networks:
+      - management
+
+networks:
+  management:
+    internal: true

@@ -10,3 +10,5 @@ incomudon-server.exe
 /control/cookie.secret
 /private-control/*
 !/private-control/services.csv.example
+/management-pcl/*
+!/management-pcl/README.md
