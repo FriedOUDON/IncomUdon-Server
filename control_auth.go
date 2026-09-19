@@ -533,6 +533,9 @@ func (s *server) setPeerServiceAdmission(channelID uint32, senderID uint32, addr
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.serviceAdmission == nil || !s.serviceAdmission.admissionAllowedForMembership(channelID, admission, time.Now()) {
+		return false
+	}
 	ch := s.channels[channelID]
 	if ch == nil {
 		return false

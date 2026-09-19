@@ -1590,10 +1590,12 @@ func TestManagedServiceRevocationRemovesMembership(t *testing.T) {
 	serviceAddr := newTestUDPConn(t)
 	s := newServer(relay, false, false, false, 0, false, 1)
 	now := time.Now()
-	grantHash := sha256.Sum256([]byte("revoked-grant"))
-	s.configureServiceAdmission(&serviceAdmissionState{mode: serviceAdmissionEnabled, pending: make(map[serviceAdmissionKey]servicePendingAdmission), verified: make(map[serviceAdmissionKey]serviceAdmission), failed: make(map[serviceAdmissionKey]serviceAdmissionFailure), revoked: make(map[[sha256.Size]byte]time.Time), revokedServices: make(map[string]time.Time)})
-	s.channels[100] = &channel{peers: map[string]*peer{peerMapKey(serviceAddr.LocalAddr().(*net.UDPAddr)): {addr: serviceAddr.LocalAddr().(*net.UDPAddr), senderId: 9001, membershipDeadline: now.Add(time.Minute), serviceAdmission: &serviceAdmission{serviceID: "recorder-01", permissions: identityPermissionListen | identityPermissionTalk, grantExpires: now.Add(time.Minute), grantHash: grantHash}}}, activeTalkers: map[uint32]time.Time{9001: now}, codecConfigs: make(map[uint32][]byte), mediaCodecConfigs: make(map[uint32]codecConfigState)}
-	s.revokeManagedServiceAdmission("recorder-01", &grantHash)
+	s.configureServiceAdmission(&serviceAdmissionState{mode: serviceAdmissionEnabled, pending: make(map[serviceAdmissionKey]servicePendingAdmission), verified: make(map[serviceAdmissionKey]serviceAdmission), failed: make(map[serviceAdmissionKey]serviceAdmissionFailure), denied: make(map[serviceAdmissionDenyRule]time.Time)})
+	s.channels[100] = &channel{peers: map[string]*peer{peerMapKey(serviceAddr.LocalAddr().(*net.UDPAddr)): {addr: serviceAddr.LocalAddr().(*net.UDPAddr), senderId: 9001, membershipDeadline: now.Add(time.Minute), serviceAdmission: &serviceAdmission{serviceID: "recorder-01", permissions: identityPermissionListen | identityPermissionTalk, grantExpires: now.Add(time.Minute)}}}, activeTalkers: map[uint32]time.Time{9001: now}, codecConfigs: make(map[uint32][]byte), mediaCodecConfigs: make(map[uint32]codecConfigState)}
+	result, applied := s.revokeManagedServiceAdmission(serviceAdmissionRevocationTarget{channelID: 100, serviceID: "recorder-01"}, time.Minute, now)
+	if !applied || result.affectedMemberships != 1 || result.talkReleases != 1 {
+		t.Fatalf("revocation result = %+v, applied=%t", result, applied)
+	}
 	if channel := s.channels[100]; channel != nil {
 		if _, found := channel.peers[peerMapKey(serviceAddr.LocalAddr().(*net.UDPAddr))]; found || s.isTalker(100, 9001) {
 			t.Fatal("revocation retained the managed service membership or active talker")
@@ -1783,6 +1785,7 @@ func newPrivateControlTestLeaf(t *testing.T, issuer *x509.Certificate, issuerKey
 func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	relay := newTestUDPConn(t)
 	server := newServer(relay, false, false, false, 0, false, 1)
+	server.configureServiceAdmission(&serviceAdmissionState{mode: serviceAdmissionEnabled, pending: make(map[serviceAdmissionKey]servicePendingAdmission), verified: make(map[serviceAdmissionKey]serviceAdmission), failed: make(map[serviceAdmissionKey]serviceAdmissionFailure), denied: make(map[serviceAdmissionDenyRule]time.Time)})
 	serverConfig, clientConfig, clientDigest := newPrivateControlTestTLSConfigs(t)
 	link, err := newPrivateControlLink(server, privateControlPolicy{byCertificate: map[string]string{clientDigest: "management-main"}}, "relay-test")
 	if err != nil {
@@ -1829,7 +1832,7 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	if err := decodePrivateControlJSON(rawAck, &ack); err != nil {
 		t.Fatalf("decode hello_ack: %v", err)
 	}
-	if ack.Type != "hello_ack" || ack.InReplyTo != helloID || ack.RelayID != "relay-test" || !ack.LifecycleEventsAccepted || ack.AuditInputsAccepted {
+	if ack.Type != "hello_ack" || ack.InReplyTo != helloID || ack.RelayID != "relay-test" || !ack.LifecycleEventsAccepted || !ack.AuditInputsAccepted {
 		t.Fatalf("unexpected hello_ack: %+v", ack)
 	}
 	rawHealth, err := readPrivateControlFrame(client)
@@ -1842,5 +1845,31 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	}
 	if health.Type != privateControlLifecycleEventType || health.EventType != "relay_health_changed" || health.ChannelID != nil || health.State == nil || *health.State != "healthy" {
 		t.Fatalf("unexpected initial health event: %+v", health)
+	}
+
+	grantIDHash := sha256.Sum256([]byte("private-control-test-grant"))
+	revocation := privateControlRevokeServiceAdmission{
+		SchemaVersion:  privateControlSchemaVersion,
+		Type:           "revoke_service_admission",
+		MessageID:      "MDEyMzQ1Njc4OTo7PD0-Pw",
+		ChannelID:      111,
+		ServiceID:      "recorder-01",
+		GrantIDHash:    base64.RawURLEncoding.EncodeToString(grantIDHash[:]),
+		Reason:         "grant_revoked",
+		DenyForSeconds: 60,
+	}
+	if err := writePrivateControlFrame(client, revocation); err != nil {
+		t.Fatalf("write revocation: %v", err)
+	}
+	rawRevocationAck, err := readPrivateControlFrame(client)
+	if err != nil {
+		t.Fatalf("read revocation ack: %v", err)
+	}
+	var revocationAck privateControlAck
+	if err := decodePrivateControlJSON(rawRevocationAck, &revocationAck); err != nil {
+		t.Fatalf("decode revocation ack: %v", err)
+	}
+	if revocationAck.Type != "ack" || revocationAck.InReplyTo != revocation.MessageID || revocationAck.Outcome != "applied" || revocationAck.AffectedMembershipCount != 0 || revocationAck.TalkReleaseCount != 0 {
+		t.Fatalf("unexpected revocation ack: %+v", revocationAck)
 	}
 }

@@ -285,20 +285,28 @@ listener for a Management Service. It is distinct from the Management Plane
 HTTPS API and **must** use a different listener address. Bind it only to a
 private administration network.
 
-This Relay's P1 profile implements outbound, live-only lifecycle export. A
-Management Service starts a `private-control-link-v1` session with `hello` and
-`want_lifecycle_events: true`; the Relay accepts that capability and sends a
-bounded, best-effort stream of redacted `relay_lifecycle_event` messages. The
-Relay does not retain, replay, or assign SSE cursor IDs to these events. A
-full queue drops the affected event rather than delaying media forwarding.
-The Management Service is responsible for any durable audit or SSE storage.
+This Relay implements the mTLS transport profile of Private Control Link v1.
+A Management Service starts a `private-control-link-v1` session with `hello`.
+The Relay independently accepts requested lifecycle-event and audit-input
+capabilities, then uses bounded, best-effort queues for redacted outbound
+notifications. It neither retains nor replays those notifications, and never
+assigns external SSE cursor IDs. A full queue drops the affected notification
+rather than delaying media forwarding; the Management Service owns any durable
+SSE or audit storage.
 
-P1 exports `participant_joined`, `participant_left`, `talk_started`,
+The Relay exports `participant_joined`, `participant_left`, `talk_started`,
 `talk_ended`, `service_admission_issued`, `service_admission_revoked`, and an
-initial `relay_health_changed` event. It does not yet implement inbound
-`revoke_service_admission` commands or `relay_audit_input`; `hello_ack`
-therefore reports `audit_inputs_accepted: false` and unsupported commands are
-rejected.
+initial `relay_health_changed` event when lifecycle events are accepted. When
+audit inputs are accepted, admission-identified Floor Interrupt requests also
+emit redacted `relay_audit_input` messages.
+
+The authenticated Management Service may send a channel-scoped
+`revoke_service_admission` command. The Relay installs its bounded deny rule
+before acknowledging it, removes only memberships matching every supplied
+target field, and releases matching active talkers with
+`SERVICE_ADMISSION_REVOKED`. Duplicate commands with the same `message_id` and
+body replay their cached acknowledgement for at least ten minutes; reuse of a
+message ID with a different body closes the link.
 
 Authorize mTLS client certificates with a separate strict CSV policy file:
 

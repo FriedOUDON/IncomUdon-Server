@@ -1049,52 +1049,66 @@ func (s *server) publishManagementEvent(eventType string, channelID *uint32, sen
 	}
 }
 
-// revokeManagedServiceAdmission is the Relay-side target for a private,
-// authenticated Management Service revocation update. The HTTPS API does not
-// expose this privileged operation; deployments invoke it through their private
-// management control link or policy reload path.
-func (s *server) revokeManagedServiceAdmission(serviceID string, grantHash *[sha256.Size]byte) {
-	if s.serviceAdmission != nil {
-		s.serviceAdmission.revoke(grantHash, serviceID, time.Now())
+type managedServiceRevocationResult struct {
+	affectedMemberships uint32
+	talkReleases        uint32
+}
+
+// revokeManagedServiceAdmission commits the Relay-side effects for one
+// channel-scoped Private Control Link revocation. The deny rule is installed
+// before existing memberships are removed so a racing admission flow fails
+// closed.
+func (s *server) revokeManagedServiceAdmission(target serviceAdmissionRevocationTarget, denyFor time.Duration, now time.Time) (managedServiceRevocationResult, bool) {
+	if s.serviceAdmission == nil || !s.serviceAdmission.installRevocation(target, denyFor, now) {
+		return managedServiceRevocationResult{}, false
 	}
 	type revokedPeer struct {
 		channelID uint32
 		senderID  uint32
 		serviceID string
 		active    bool
+		peer      *peer
 	}
 	s.mu.Lock()
 	revoked := make([]revokedPeer, 0)
-	for channelID, channel := range s.channels {
+	channel := s.channels[target.channelID]
+	if channel != nil {
 		for key, peer := range channel.peers {
 			if peer.serviceAdmission == nil ||
-				(serviceID != "" && peer.serviceAdmission.serviceID != serviceID) ||
-				(grantHash != nil && peer.serviceAdmission.grantHash != *grantHash) {
+				!target.matches(target.channelID, *peer.serviceAdmission) {
 				continue
 			}
 			active := false
 			if _, active = channel.activeTalkers[peer.senderId]; active {
 				delete(channel.activeTalkers, peer.senderId)
 			}
-			revoked = append(revoked, revokedPeer{channelID: channelID, senderID: peer.senderId, serviceID: peer.serviceAdmission.serviceID, active: active})
+			revoked = append(revoked, revokedPeer{channelID: target.channelID, senderID: peer.senderId, serviceID: peer.serviceAdmission.serviceID, active: active, peer: peer})
 			delete(channel.peers, key)
 			delete(channel.codecConfigs, peer.senderId)
 			delete(channel.mediaCodecConfigs, peer.senderId)
 		}
 		if len(channel.peers) == 0 {
-			delete(s.channels, channelID)
+			delete(s.channels, target.channelID)
 		}
 	}
 	s.mu.Unlock()
+	result := managedServiceRevocationResult{affectedMemberships: uint32(len(revoked))}
 	for _, peer := range revoked {
 		if s.management != nil {
 			s.management.appendAudit(managementAuditRecord{ActorType: "relay", ActorID: "relay", ChannelID: uint32Pointer(peer.channelID), Action: "service_admission_revoked", Result: "success"})
 		}
 		if peer.active {
 			s.broadcastRelayControl(peer.channelID, pktTalkRelease, peer.senderID, talkReleasePayload(peer.senderID, talkReleaseServiceRevoked))
+			// The target was removed from the membership map before the broadcast
+			// snapshot. Deliver its mandatory release directly as well.
+			if packet := s.relayControlForPeer(peer.channelID, peer.peer, pktTalkRelease, peer.senderID, talkReleasePayload(peer.senderID, talkReleaseServiceRevoked)); len(packet) > 0 {
+				_, _ = s.conn.WriteToUDP(packet, peer.peer.addr)
+			}
+			result.talkReleases++
 			s.publishManagementEvent("talk_ended", uint32Pointer(peer.channelID), uint32Pointer(peer.senderID), stringPointer(peer.serviceID), nil, nil, stringPointer("SERVICE_ADMISSION_REVOKED"))
 		}
 		s.publishManagementEvent("participant_left", uint32Pointer(peer.channelID), uint32Pointer(peer.senderID), stringPointer(peer.serviceID), nil, nil, stringPointer("SERVICE_ADMISSION_REVOKED"))
 		s.publishManagementEvent("service_admission_revoked", uint32Pointer(peer.channelID), uint32Pointer(peer.senderID), stringPointer(peer.serviceID), nil, nil, stringPointer("SERVICE_ADMISSION_REVOKED"))
 	}
+	return result, true
 }

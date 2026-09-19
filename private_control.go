@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -28,9 +29,17 @@ const (
 	privateControlHelloDeadline       = 5 * time.Second
 	privateControlTLSMinVersion       = tls.VersionTLS13
 	privateControlLifecycleEventType  = "relay_lifecycle_event"
+	privateControlAuditInputType      = "relay_audit_input"
 	privateControlUnsupportedMessage  = "unsupported_message"
 	privateControlIdentityMismatch    = "identity_mismatch"
 	privateControlMalformedConnection = "malformed private control frame"
+	privateControlIdempotencyTTL      = 10 * time.Minute
+	privateControlMaxIdempotency      = 1024
+	privateControlMaxCommands         = 32
+	privateControlMaxConnections      = 64
+	privateControlFailureWindow       = time.Minute
+	privateControlMaxFailures         = 8
+	privateControlMaxFailureSources   = 1024
 )
 
 type privateControlConfig struct {
@@ -47,19 +56,43 @@ type privateControlPolicy struct {
 }
 
 type privateControlLink struct {
-	relayID  string
-	policy   privateControlPolicy
-	mu       sync.Mutex
-	sessions map[string]*privateControlSession
-	dropped  uint64
+	server       *server
+	relayID      string
+	policy       privateControlPolicy
+	mu           sync.Mutex
+	sessions     map[string]*privateControlSession
+	dropped      uint64
+	failures     map[string]privateControlFailureState
+	idempotency  map[privateControlIdempotencyKey]*privateControlIdempotencyEntry
+	commandSlots chan struct{}
+	connections  chan struct{}
 }
 
 type privateControlSession struct {
 	serviceID       string
 	lifecycleEvents bool
+	auditInputs     bool
 	send            chan any
 	done            chan struct{}
 	closeOnce       sync.Once
+}
+
+type privateControlFailureState struct {
+	windowStarted time.Time
+	count         uint8
+	lastSeen      time.Time
+}
+
+type privateControlIdempotencyKey struct {
+	serviceID string
+	messageID string
+}
+
+type privateControlIdempotencyEntry struct {
+	bodyHash  [sha256.Size]byte
+	ack       *privateControlAck
+	done      chan struct{}
+	expiresAt time.Time
 }
 
 type privateControlHello struct {
@@ -75,6 +108,27 @@ type privateControlPing struct {
 	SchemaVersion string `json:"schema_version"`
 	Type          string `json:"type"`
 	MessageID     string `json:"message_id"`
+}
+
+type privateControlRevokeServiceAdmission struct {
+	SchemaVersion  string `json:"schema_version"`
+	Type           string `json:"type"`
+	MessageID      string `json:"message_id"`
+	ChannelID      uint32 `json:"channel_id"`
+	ServiceID      string `json:"service_id,omitempty"`
+	GrantIDHash    string `json:"grant_id_hash,omitempty"`
+	Reason         string `json:"reason"`
+	DenyForSeconds uint16 `json:"deny_for_seconds"`
+}
+
+type privateControlAck struct {
+	SchemaVersion           string `json:"schema_version"`
+	Type                    string `json:"type"`
+	MessageID               string `json:"message_id"`
+	InReplyTo               string `json:"in_reply_to"`
+	Outcome                 string `json:"outcome"`
+	AffectedMembershipCount uint32 `json:"affected_membership_count"`
+	TalkReleaseCount        uint32 `json:"talk_release_count"`
 }
 
 type privateControlCommandEnvelope struct {
@@ -123,6 +177,25 @@ type privateControlLifecycleEvent struct {
 	Reason         *string `json:"reason,omitempty"`
 }
 
+type privateControlFloorInterruptAudit struct {
+	RequesterPriority uint8   `json:"requester_priority"`
+	ReplacedSenderID  *uint32 `json:"replaced_sender_id"`
+	ReplacedPriority  *uint8  `json:"replaced_priority"`
+}
+
+type privateControlAuditInput struct {
+	SchemaVersion  string                             `json:"schema_version"`
+	Type           string                             `json:"type"`
+	MessageID      string                             `json:"message_id"`
+	OccurredAt     string                             `json:"occurred_at"`
+	Action         string                             `json:"action"`
+	ActorType      string                             `json:"actor_type"`
+	ActorID        string                             `json:"actor_id"`
+	ChannelID      *uint32                            `json:"channel_id"`
+	Result         string                             `json:"result"`
+	FloorInterrupt *privateControlFloorInterruptAudit `json:"floor_interrupt,omitempty"`
+}
+
 func loadPrivateControlPolicy(path string) (privateControlPolicy, error) {
 	if strings.TrimSpace(path) == "" {
 		return privateControlPolicy{}, errors.New("private control services CSV is required")
@@ -164,7 +237,11 @@ func newPrivateControlLink(server *server, policy privateControlPolicy, relayID 
 	if server == nil || strings.TrimSpace(relayID) == "" || len(relayID) > 128 || len(policy.byCertificate) == 0 {
 		return nil, errors.New("invalid private control link configuration")
 	}
-	return &privateControlLink{relayID: relayID, policy: policy, sessions: make(map[string]*privateControlSession)}, nil
+	return &privateControlLink{
+		server: server, relayID: relayID, policy: policy, sessions: make(map[string]*privateControlSession),
+		failures: make(map[string]privateControlFailureState), idempotency: make(map[privateControlIdempotencyKey]*privateControlIdempotencyEntry),
+		commandSlots: make(chan struct{}, privateControlMaxCommands), connections: make(chan struct{}, privateControlMaxConnections),
+	}, nil
 }
 
 func newPrivateControlID() (string, error) {
@@ -184,6 +261,9 @@ func validPrivateControlID(value string) bool {
 }
 
 func validatePrivateControlJSON(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return errors.New("invalid UTF-8 JSON")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if err := scanPrivateControlJSONValue(decoder); err != nil {
 		return err
@@ -268,6 +348,193 @@ func decodePrivateControlJSON(raw []byte, target any) error {
 		return err
 	}
 	return nil
+}
+
+func decodePrivateControlGrantIDHash(value string) (*[sha256.Size]byte, bool) {
+	if value == "" {
+		return nil, true
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size || base64.RawURLEncoding.EncodeToString(decoded) != value {
+		return nil, false
+	}
+	var hash [sha256.Size]byte
+	copy(hash[:], decoded)
+	return &hash, true
+}
+
+func validPrivateControlRevocation(message privateControlRevokeServiceAdmission) (serviceAdmissionRevocationTarget, bool) {
+	if message.SchemaVersion != privateControlSchemaVersion || message.Type != "revoke_service_admission" ||
+		!validPrivateControlID(message.MessageID) || len(message.ServiceID) > 128 ||
+		(message.Reason != "acl_removed" && message.Reason != "service_disabled" && message.Reason != "grant_revoked") ||
+		message.DenyForSeconds == 0 || message.DenyForSeconds > 5400 {
+		return serviceAdmissionRevocationTarget{}, false
+	}
+	grantIDHash, valid := decodePrivateControlGrantIDHash(message.GrantIDHash)
+	if !valid || (message.ServiceID == "" && grantIDHash == nil) {
+		return serviceAdmissionRevocationTarget{}, false
+	}
+	return serviceAdmissionRevocationTarget{channelID: message.ChannelID, serviceID: message.ServiceID, grantIDHash: grantIDHash}, true
+}
+
+func privateControlRevocationDigest(message privateControlRevokeServiceAdmission) ([sha256.Size]byte, error) {
+	canonical, err := json.Marshal(message)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return sha256.Sum256(canonical), nil
+}
+
+func (l *privateControlLink) cleanupIdempotencyLocked(now time.Time) {
+	for key, entry := range l.idempotency {
+		if entry.ack != nil && !entry.expiresAt.After(now) {
+			delete(l.idempotency, key)
+		}
+	}
+	for source, state := range l.failures {
+		if now.Sub(state.lastSeen) > privateControlFailureWindow {
+			delete(l.failures, source)
+		}
+	}
+}
+
+// beginRevocation returns a cached acknowledgement, a pending completion signal,
+// or authority for this caller to execute the command exactly once.
+func (l *privateControlLink) beginRevocation(serviceID string, messageID string, bodyHash [sha256.Size]byte, now time.Time) (cached *privateControlAck, pending <-chan struct{}, execute bool, conflict bool, overloaded bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.cleanupIdempotencyLocked(now)
+	key := privateControlIdempotencyKey{serviceID: serviceID, messageID: messageID}
+	if entry, found := l.idempotency[key]; found {
+		if entry.bodyHash != bodyHash {
+			return nil, nil, false, true, false
+		}
+		if entry.ack != nil {
+			copy := *entry.ack
+			return &copy, nil, false, false, false
+		}
+		return nil, entry.done, false, false, false
+	}
+	if len(l.idempotency) >= privateControlMaxIdempotency {
+		return nil, nil, false, false, true
+	}
+	l.idempotency[key] = &privateControlIdempotencyEntry{bodyHash: bodyHash, done: make(chan struct{}), expiresAt: now.Add(privateControlIdempotencyTTL)}
+	return nil, nil, true, false, false
+}
+
+func (l *privateControlLink) completeRevocation(serviceID string, messageID string, bodyHash [sha256.Size]byte, ack *privateControlAck, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := privateControlIdempotencyKey{serviceID: serviceID, messageID: messageID}
+	entry := l.idempotency[key]
+	if entry == nil || entry.bodyHash != bodyHash || entry.ack != nil {
+		return
+	}
+	copy := *ack
+	entry.ack = &copy
+	entry.expiresAt = now.Add(privateControlIdempotencyTTL)
+	close(entry.done)
+}
+
+func (l *privateControlLink) abandonRevocation(serviceID string, messageID string, bodyHash [sha256.Size]byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := privateControlIdempotencyKey{serviceID: serviceID, messageID: messageID}
+	entry := l.idempotency[key]
+	if entry == nil || entry.bodyHash != bodyHash || entry.ack != nil {
+		return
+	}
+	delete(l.idempotency, key)
+	close(entry.done)
+}
+
+func (l *privateControlLink) cachedCompletedRevocation(serviceID string, messageID string, bodyHash [sha256.Size]byte) *privateControlAck {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.idempotency[privateControlIdempotencyKey{serviceID: serviceID, messageID: messageID}]
+	if entry == nil || entry.bodyHash != bodyHash || entry.ack == nil {
+		return nil
+	}
+	copy := *entry.ack
+	return &copy
+}
+
+func (l *privateControlLink) acquireCommand() bool {
+	select {
+	case l.commandSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *privateControlLink) releaseCommand() {
+	<-l.commandSlots
+}
+
+func (l *privateControlLink) acquireConnection() bool {
+	select {
+	case l.connections <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *privateControlLink) releaseConnection() {
+	<-l.connections
+}
+
+func privateControlFailureSource(connection net.Conn) string {
+	if connection == nil || connection.RemoteAddr() == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(connection.RemoteAddr().String())
+	if err == nil && host != "" {
+		return host
+	}
+	return connection.RemoteAddr().Network()
+}
+
+func (l *privateControlLink) allowConnectionAttempt(source string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.cleanupIdempotencyLocked(now)
+	state, found := l.failures[source]
+	if !found || now.Sub(state.windowStarted) >= privateControlFailureWindow {
+		return true
+	}
+	return state.count < privateControlMaxFailures
+}
+
+func (l *privateControlLink) recordConnectionFailure(source string, reasonClass string) {
+	now := time.Now()
+	l.mu.Lock()
+	l.cleanupIdempotencyLocked(now)
+	state := l.failures[source]
+	if state.windowStarted.IsZero() || now.Sub(state.windowStarted) >= privateControlFailureWindow {
+		if len(l.failures) >= privateControlMaxFailureSources {
+			var oldestSource string
+			var oldestSeen time.Time
+			for candidate, existing := range l.failures {
+				if oldestSeen.IsZero() || existing.lastSeen.Before(oldestSeen) {
+					oldestSource, oldestSeen = candidate, existing.lastSeen
+				}
+			}
+			if oldestSource != "" {
+				delete(l.failures, oldestSource)
+			}
+		}
+		state = privateControlFailureState{windowStarted: now}
+	}
+	if state.count < ^uint8(0) {
+		state.count++
+	}
+	state.lastSeen = now
+	l.failures[source] = state
+	count := state.count
+	l.mu.Unlock()
+	log.Printf("private_control_failure class=%s count=%d", reasonClass, count)
 }
 
 func readPrivateControlFrame(reader io.Reader) ([]byte, error) {
@@ -368,6 +635,16 @@ func (l *privateControlLink) enqueueLifecycleEvent(event privateControlLifecycle
 	}
 }
 
+func (l *privateControlLink) enqueueAuditInput(input privateControlAuditInput) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, session := range l.sessions {
+		if session.auditInputs && !session.enqueue(input) {
+			l.dropped++
+		}
+	}
+}
+
 func (l *privateControlLink) publishLifecycleEvent(eventType string, channelID *uint32, senderID *uint32, serviceID *string, jobID *string, state *string, reason *string) {
 	event, err := newPrivateControlLifecycleEvent(eventType, channelID, senderID, serviceID, jobID, state, reason)
 	if err != nil {
@@ -375,6 +652,33 @@ func (l *privateControlLink) publishLifecycleEvent(eventType string, channelID *
 		return
 	}
 	l.enqueueLifecycleEvent(event)
+}
+
+func (l *privateControlLink) publishFloorInterruptAudit(actorType string, actorID string, channelID uint32, requesterPriority uint8, result string, replacedSenderID *uint32, replacedPriority *uint8) {
+	if actorType != "identity" && actorType != "service" || actorID == "" || (result != "success" && result != "denied" && result != "failed") {
+		return
+	}
+	messageID, err := newPrivateControlID()
+	if err != nil {
+		log.Printf("private control audit input ID failed: %v", err)
+		return
+	}
+	l.enqueueAuditInput(privateControlAuditInput{
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          privateControlAuditInputType,
+		MessageID:     messageID,
+		OccurredAt:    time.Now().UTC().Format(time.RFC3339),
+		Action:        "floor_interrupt",
+		ActorType:     actorType,
+		ActorID:       actorID,
+		ChannelID:     uint32Pointer(channelID),
+		Result:        result,
+		FloorInterrupt: &privateControlFloorInterruptAudit{
+			RequesterPriority: requesterPriority,
+			ReplacedSenderID:  replacedSenderID,
+			ReplacedPriority:  replacedPriority,
+		},
+	})
 }
 
 func newPrivateControlLifecycleEvent(eventType string, channelID *uint32, senderID *uint32, serviceID *string, jobID *string, state *string, reason *string) (privateControlLifecycleEvent, error) {
@@ -431,7 +735,14 @@ func (l *privateControlLink) acceptLoop(listener net.Listener) {
 			log.Printf("private control listener failed: %v", err)
 			return
 		}
-		go l.handleConnection(connection)
+		if !l.acquireConnection() {
+			_ = connection.Close()
+			continue
+		}
+		go func(connection net.Conn) {
+			defer l.releaseConnection()
+			l.handleConnection(connection)
+		}(connection)
 	}
 }
 
@@ -469,28 +780,114 @@ func decodePrivateControlSelector(raw []byte) (privateControlCommandEnvelope, er
 	return selector, nil
 }
 
+func (l *privateControlLink) handleRevocation(session *privateControlSession, raw []byte, selector privateControlCommandEnvelope) (any, bool) {
+	var command privateControlRevokeServiceAdmission
+	if err := decodePrivateControlJSON(raw, &command); err != nil {
+		return nil, true
+	}
+	target, valid := validPrivateControlRevocation(command)
+	if !valid {
+		return nil, true
+	}
+	bodyHash, err := privateControlRevocationDigest(command)
+	if err != nil {
+		return nil, true
+	}
+	cached, pending, execute, conflict, overloaded := l.beginRevocation(session.serviceID, selector.MessageID, bodyHash, time.Now())
+	if conflict {
+		// Reusing a message ID with a different command body is a protocol error.
+		return nil, true
+	}
+	if cached != nil {
+		return *cached, false
+	}
+	if overloaded {
+		response, err := newPrivateControlError(selector.MessageID, "overloaded")
+		return response, err != nil
+	}
+	if pending != nil {
+		select {
+		case <-pending:
+			if ack := l.cachedCompletedRevocation(session.serviceID, selector.MessageID, bodyHash); ack != nil {
+				return *ack, false
+			}
+		case <-time.After(privateControlHelloDeadline):
+		}
+		response, err := newPrivateControlError(selector.MessageID, "overloaded")
+		return response, err != nil
+	}
+	if !execute {
+		response, err := newPrivateControlError(selector.MessageID, "overloaded")
+		return response, err != nil
+	}
+	if !l.acquireCommand() {
+		l.abandonRevocation(session.serviceID, selector.MessageID, bodyHash)
+		response, err := newPrivateControlError(selector.MessageID, "overloaded")
+		return response, err != nil
+	}
+	defer l.releaseCommand()
+
+	if l.server == nil || l.server.serviceAdmission == nil {
+		l.abandonRevocation(session.serviceID, selector.MessageID, bodyHash)
+		response, err := newPrivateControlError(selector.MessageID, "unauthorized")
+		return response, err != nil
+	}
+	result, applied := l.server.revokeManagedServiceAdmission(target, time.Duration(command.DenyForSeconds)*time.Second, time.Now())
+	if !applied {
+		l.abandonRevocation(session.serviceID, selector.MessageID, bodyHash)
+		response, err := newPrivateControlError(selector.MessageID, "overloaded")
+		return response, err != nil
+	}
+	ackID, err := newPrivateControlID()
+	if err != nil {
+		l.abandonRevocation(session.serviceID, selector.MessageID, bodyHash)
+		return nil, true
+	}
+	ack := privateControlAck{
+		SchemaVersion:           privateControlSchemaVersion,
+		Type:                    "ack",
+		MessageID:               ackID,
+		InReplyTo:               selector.MessageID,
+		Outcome:                 "applied",
+		AffectedMembershipCount: result.affectedMemberships,
+		TalkReleaseCount:        result.talkReleases,
+	}
+	l.completeRevocation(session.serviceID, selector.MessageID, bodyHash, &ack, time.Now())
+	return ack, false
+}
+
 func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 	defer rawConnection.Close()
 	connection, ok := rawConnection.(*tls.Conn)
 	if !ok {
 		return
 	}
+	source := privateControlFailureSource(connection)
+	if !l.allowConnectionAttempt(source, time.Now()) {
+		return
+	}
 	if err := connection.SetDeadline(time.Now().Add(privateControlHelloDeadline)); err != nil {
 		return
 	}
 	if err := connection.Handshake(); err != nil {
+		l.recordConnectionFailure(source, "handshake")
 		return
 	}
 	serviceID, err := privateControlServiceForConnection(connection, l.policy)
 	if err != nil {
+		l.recordConnectionFailure(source, "authorization")
 		return
 	}
 	rawHello, err := readPrivateControlFrame(connection)
 	if err != nil {
+		if !errors.Is(err, io.EOF) {
+			l.recordConnectionFailure(source, "frame")
+		}
 		return
 	}
 	var hello privateControlHello
 	if err := decodePrivateControlJSON(rawHello, &hello); err != nil || !validPrivateControlHello(hello) {
+		l.recordConnectionFailure(source, "hello")
 		return
 	}
 	if hello.ManagementServiceID != serviceID {
@@ -505,6 +902,7 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 	session := &privateControlSession{
 		serviceID:       serviceID,
 		lifecycleEvents: *hello.WantLifecycleEvents,
+		auditInputs:     *hello.WantAuditInputs,
 		send:            make(chan any, privateControlSessionQueueDepth),
 		done:            make(chan struct{}),
 	}
@@ -528,7 +926,7 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 		SessionID:               sessionID,
 		RelayID:                 l.relayID,
 		LifecycleEventsAccepted: *hello.WantLifecycleEvents,
-		AuditInputsAccepted:     false,
+		AuditInputsAccepted:     *hello.WantAuditInputs,
 	}) {
 		return
 	}
@@ -542,16 +940,21 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 	for {
 		rawMessage, err := readPrivateControlFrame(connection)
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				l.recordConnectionFailure(source, "frame")
+			}
 			return
 		}
 		selector, err := decodePrivateControlSelector(rawMessage)
 		if err != nil {
+			l.recordConnectionFailure(source, "frame")
 			return
 		}
 		switch selector.Type {
 		case "ping":
 			var ping privateControlPing
 			if err := decodePrivateControlJSON(rawMessage, &ping); err != nil || !validPrivateControlPing(ping) {
+				l.recordConnectionFailure(source, "schema")
 				return
 			}
 			pongID, err := newPrivateControlID()
@@ -561,6 +964,14 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 				MessageID:     pongID,
 				InReplyTo:     ping.MessageID,
 			}) {
+				return
+			}
+		case "revoke_service_admission":
+			response, closeConnection := l.handleRevocation(session, rawMessage, selector)
+			if closeConnection || response == nil || !session.enqueue(response) {
+				if closeConnection {
+					l.recordConnectionFailure(source, "command")
+				}
 				return
 			}
 		default:

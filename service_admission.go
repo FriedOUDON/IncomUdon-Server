@@ -25,6 +25,7 @@ const (
 	serviceGrantMaxBytes             = 768
 	serviceChallengeTTL              = 30 * time.Second
 	maxPendingServiceAdmissions      = 1024
+	maxServiceAdmissionDenyRules     = 1024
 	maximumServiceGrantLifetime      = 3600
 	minimumServiceGrantLifetime      = 60
 	maximumServiceAdmissionGraceSecs = 1800
@@ -49,16 +50,15 @@ const (
 type serviceSigningKeyStore map[string]ed25519.PublicKey
 
 type serviceAdmissionState struct {
-	mu              sync.Mutex
-	mode            serviceAdmissionMode
-	issuer          string
-	audience        string
-	keys            serviceSigningKeyStore
-	pending         map[serviceAdmissionKey]servicePendingAdmission
-	verified        map[serviceAdmissionKey]serviceAdmission
-	failed          map[serviceAdmissionKey]serviceAdmissionFailure
-	revoked         map[[sha256.Size]byte]time.Time
-	revokedServices map[string]time.Time
+	mu       sync.Mutex
+	mode     serviceAdmissionMode
+	issuer   string
+	audience string
+	keys     serviceSigningKeyStore
+	pending  map[serviceAdmissionKey]servicePendingAdmission
+	verified map[serviceAdmissionKey]serviceAdmission
+	failed   map[serviceAdmissionKey]serviceAdmissionFailure
+	denied   map[serviceAdmissionDenyRule]time.Time
 }
 
 type serviceAdmissionKey struct {
@@ -76,8 +76,51 @@ type serviceAdmission struct {
 	grantExpires time.Time
 	grace        time.Duration
 	grantHash    [sha256.Size]byte
-	grantIDHash  [16]byte
-	actorIDHash  [16]byte
+	grantIDHash  [sha256.Size]byte
+}
+
+// serviceAdmissionRevocationTarget is channel-scoped. When both target fields
+// are populated, matching is deliberately an intersection rather than an OR.
+type serviceAdmissionRevocationTarget struct {
+	channelID   uint32
+	serviceID   string
+	grantIDHash *[sha256.Size]byte
+}
+
+type serviceAdmissionDenyRule struct {
+	channelID      uint32
+	serviceID      string
+	grantIDHash    [sha256.Size]byte
+	hasGrantIDHash bool
+}
+
+func (target serviceAdmissionRevocationTarget) matches(channelID uint32, admission serviceAdmission) bool {
+	if target.channelID != channelID {
+		return false
+	}
+	if target.serviceID != "" && target.serviceID != admission.serviceID {
+		return false
+	}
+	return target.grantIDHash == nil || *target.grantIDHash == admission.grantIDHash
+}
+
+func (target serviceAdmissionRevocationTarget) denyRule() serviceAdmissionDenyRule {
+	rule := serviceAdmissionDenyRule{channelID: target.channelID, serviceID: target.serviceID}
+	if target.grantIDHash != nil {
+		rule.grantIDHash = *target.grantIDHash
+		rule.hasGrantIDHash = true
+	}
+	return rule
+}
+
+func (rule serviceAdmissionDenyRule) matches(channelID uint32, admission serviceAdmission) bool {
+	if rule.channelID != channelID {
+		return false
+	}
+	if rule.serviceID != "" && rule.serviceID != admission.serviceID {
+		return false
+	}
+	return !rule.hasGrantIDHash || rule.grantIDHash == admission.grantIDHash
 }
 
 type servicePendingAdmission struct {
@@ -188,11 +231,10 @@ func newServiceAdmissionState(mode serviceAdmissionMode, issuer string, audience
 	}
 	return &serviceAdmissionState{
 		mode: mode, issuer: issuer, audience: audience, keys: keys,
-		pending:         make(map[serviceAdmissionKey]servicePendingAdmission),
-		verified:        make(map[serviceAdmissionKey]serviceAdmission),
-		failed:          make(map[serviceAdmissionKey]serviceAdmissionFailure),
-		revoked:         make(map[[sha256.Size]byte]time.Time),
-		revokedServices: make(map[string]time.Time),
+		pending:  make(map[serviceAdmissionKey]servicePendingAdmission),
+		verified: make(map[serviceAdmissionKey]serviceAdmission),
+		failed:   make(map[serviceAdmissionKey]serviceAdmissionFailure),
+		denied:   make(map[serviceAdmissionDenyRule]time.Time),
 	}, nil
 }
 
@@ -289,7 +331,6 @@ func (a *serviceAdmissionState) validateGrant(grant string, publicKey ed25519.Pu
 	}
 	grantHash := sha256.Sum256([]byte(grant))
 	grantIDHash := sha256.Sum256([]byte(claims.GrantID))
-	serviceHash := sha256.Sum256([]byte(claims.ServiceID))
 	priority := uint8(0)
 	if claims.Priority != nil {
 		priority = *claims.Priority
@@ -297,7 +338,7 @@ func (a *serviceAdmissionState) validateGrant(grant string, publicKey ed25519.Pu
 	return serviceAdmission{
 		serviceID: claims.ServiceID, role: claims.Role, permissions: claims.Permissions, priority: priority,
 		grantExpires: time.Unix(claims.ExpiresAt, 0), grace: time.Duration(graceSeconds) * time.Second,
-		grantHash: grantHash, grantIDHash: [16]byte(grantIDHash[:16]), actorIDHash: [16]byte(serviceHash[:16]),
+		grantHash: grantHash, grantIDHash: grantIDHash,
 	}, 0
 }
 
@@ -330,16 +371,65 @@ func (a *serviceAdmissionState) cleanupLocked(now time.Time) {
 			delete(a.failed, key)
 		}
 	}
-	for grantHash, expiry := range a.revoked {
+	for rule, expiry := range a.denied {
 		if !expiry.After(now) {
-			delete(a.revoked, grantHash)
+			delete(a.denied, rule)
 		}
 	}
-	for serviceID, expiry := range a.revokedServices {
-		if !expiry.After(now) {
-			delete(a.revokedServices, serviceID)
+}
+
+func (a *serviceAdmissionState) deniedLocked(channelID uint32, admission serviceAdmission) bool {
+	for rule := range a.denied {
+		if rule.matches(channelID, admission) {
+			return true
 		}
 	}
+	return false
+}
+
+// admissionAllowedForMembership closes the gap between consuming a verified
+// proof and attaching it to a peer: a PCL deny installed in that interval must
+// still prevent the membership from being created.
+func (a *serviceAdmissionState) admissionAllowedForMembership(channelID uint32, admission serviceAdmission, now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cleanupLocked(now)
+	return admission.grantCurrent(now) && !a.deniedLocked(channelID, admission)
+}
+
+// installRevocation installs a channel-scoped deny rule before evicting pending
+// state. It returns false only when a new rule cannot fit in the bounded set.
+func (a *serviceAdmissionState) installRevocation(target serviceAdmissionRevocationTarget, duration time.Duration, now time.Time) bool {
+	if a == nil || duration <= 0 || (target.serviceID == "" && target.grantIDHash == nil) {
+		return false
+	}
+	rule := target.denyRule()
+	expiresAt := now.Add(duration)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cleanupLocked(now)
+	if existing, found := a.denied[rule]; found {
+		if existing.After(expiresAt) {
+			expiresAt = existing
+		}
+	} else if len(a.denied) >= maxServiceAdmissionDenyRules {
+		return false
+	}
+	a.denied[rule] = expiresAt
+	for key, pending := range a.pending {
+		if target.matches(key.channelID, pending.admission) {
+			delete(a.pending, key)
+		}
+	}
+	for key, admission := range a.verified {
+		if target.matches(key.channelID, admission) {
+			delete(a.verified, key)
+		}
+	}
+	return true
 }
 
 func (a *serviceAdmissionState) begin(pkt parsedPacket, addr *net.UDPAddr, meta controlAuthMeta, now time.Time) ([]byte, uint8) {
@@ -359,7 +449,7 @@ func (a *serviceAdmissionState) begin(pkt parsedPacket, addr *net.UDPAddr, meta 
 	defer a.mu.Unlock()
 	a.cleanupLocked(now)
 	if denyReason == 0 {
-		if _, revoked := a.revoked[admission.grantHash]; revoked || a.revokedServices[admission.serviceID].After(now) {
+		if a.deniedLocked(pkt.Header.ChannelId, admission) {
 			denyReason = serviceDenyRevoked
 		}
 	}
@@ -412,7 +502,7 @@ func (a *serviceAdmissionState) proof(pkt parsedPacket, addr *net.UDPAddr, meta 
 		a.failed[key] = serviceAdmissionFailure{reason: serviceDenyInvalidProof, expiresAt: now.Add(serviceChallengeTTL)}
 		return serviceDenyInvalidProof
 	}
-	if _, revoked := a.revoked[pending.admission.grantHash]; revoked || a.revokedServices[pending.admission.serviceID].After(now) {
+	if a.deniedLocked(key.channelID, pending.admission) {
 		delete(a.pending, key)
 		a.failed[key] = serviceAdmissionFailure{reason: serviceDenyRevoked, expiresAt: now.Add(serviceChallengeTTL)}
 		return serviceDenyRevoked
@@ -438,7 +528,8 @@ func (a *serviceAdmissionState) takeVerifiedAdmission(pkt parsedPacket, addr *ne
 	defer a.mu.Unlock()
 	a.cleanupLocked(now)
 	admission, found := a.verified[key]
-	if !found || !admission.grantCurrent(now) {
+	if !found || !admission.grantCurrent(now) || a.deniedLocked(key.channelID, admission) {
+		delete(a.verified, key)
 		return serviceAdmission{}, false
 	}
 	delete(a.verified, key)
@@ -453,7 +544,7 @@ func (a *serviceAdmissionState) admissionForJoin(pkt parsedPacket, addr *net.UDP
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cleanupLocked(now)
-	if admission, found := a.verified[key]; found && admission.grantCurrent(now) {
+	if admission, found := a.verified[key]; found && admission.grantCurrent(now) && !a.deniedLocked(key.channelID, admission) {
 		delete(a.verified, key)
 		return admission, true, 0
 	}
@@ -464,29 +555,4 @@ func (a *serviceAdmissionState) admissionForJoin(pkt parsedPacket, addr *net.UDP
 		return serviceAdmission{}, false, serviceDenyInvalidProof
 	}
 	return serviceAdmission{}, true, 0
-}
-
-func (a *serviceAdmissionState) revoke(grantHash *[sha256.Size]byte, serviceID string, now time.Time) {
-	if a == nil {
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.cleanupLocked(now)
-	if grantHash != nil {
-		a.revoked[*grantHash] = now.Add(maximumServiceAdmissionGraceSecs * time.Second)
-	}
-	if serviceID != "" {
-		a.revokedServices[serviceID] = now.Add(maximumServiceGrantLifetime * time.Second)
-	}
-	for key, pending := range a.pending {
-		if (grantHash != nil && pending.admission.grantHash == *grantHash) || (serviceID != "" && pending.admission.serviceID == serviceID) {
-			delete(a.pending, key)
-		}
-	}
-	for key, admission := range a.verified {
-		if (grantHash != nil && admission.grantHash == *grantHash) || (serviceID != "" && admission.serviceID == serviceID) {
-			delete(a.verified, key)
-		}
-	}
 }

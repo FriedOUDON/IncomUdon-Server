@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -1003,6 +1004,30 @@ func peerAdmissionPriority(peer *peer, now time.Time) uint8 {
 	return 0
 }
 
+func peerAdmissionAuditActor(peer *peer) (string, string, bool) {
+	if peer == nil {
+		return "", "", false
+	}
+	if peer.identityAdmission != nil {
+		return "identity", base64.RawURLEncoding.EncodeToString(peer.identityAdmission.actorIDHash[:]), true
+	}
+	if peer.serviceAdmission != nil {
+		return "service", peer.serviceAdmission.serviceID, true
+	}
+	return "", "", false
+}
+
+func (s *server) publishFloorInterruptAudit(requester *peer, channelID uint32, requesterPriority uint8, result string, replacedSenderID *uint32, replacedPriority *uint8) {
+	if s.privateControl == nil {
+		return
+	}
+	actorType, actorID, ok := peerAdmissionAuditActor(requester)
+	if !ok {
+		return
+	}
+	s.privateControl.publishFloorInterruptAudit(actorType, actorID, channelID, requesterPriority, result, replacedSenderID, replacedPriority)
+}
+
 // denyPttRequest deliberately uses the ordinary TALK_DENY shape without
 // exposing whether policy, authorization, or current floor state caused it.
 func (s *server) denyPttRequest(channelId uint32, senderId uint32) {
@@ -1032,13 +1057,17 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	requester := ch.peers[peerMapKey(addr)]
 	if requester == nil || requester.senderId != senderId || requester.membershipDeadline.IsZero() || !requester.membershipDeadline.After(now) ||
 		!peerAllowsInterrupt(requester, now) {
+		requesterPriority := peerAdmissionPriority(requester, now)
 		s.mu.Unlock()
 		s.denyPttRequest(channelId, senderId)
+		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "denied", nil, nil)
 		return false
 	}
 	if _, active := ch.activeTalkers[senderId]; active {
+		requesterPriority := peerInterruptPriority(requester, now)
 		s.mu.Unlock()
 		s.sendRelayControlTo(channelId, senderId, pktTalkGrant, senderId, talkPayload(senderId))
+		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "success", nil, nil)
 		return true
 	}
 
@@ -1050,10 +1079,12 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 		limit = 1
 	}
 	if len(ch.activeTalkers) < limit {
+		requesterPriority := peerInterruptPriority(requester, now)
 		ch.activeTalkers[senderId] = now
 		s.mu.Unlock()
 		s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
 		s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
+		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "success", nil, nil)
 		return true
 	}
 
@@ -1071,6 +1102,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 		current := firstActiveTalker(ch)
 		s.mu.Unlock()
 		s.sendRelayControlTo(channelId, senderId, pktTalkDeny, current, talkPayload(current))
+		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "denied", nil, nil)
 		return true
 	}
 	delete(ch.activeTalkers, victim)
@@ -1083,6 +1115,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
 	s.publishManagementEvent("talk_ended", uint32Pointer(channelId), uint32Pointer(victim), nil, nil, nil, stringPointer("PREEMPTED"))
 	s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
+	s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "success", &victim, &victimPriority)
 	return true
 }
 
