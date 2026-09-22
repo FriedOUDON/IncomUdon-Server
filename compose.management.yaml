@@ -9,9 +9,12 @@ services:
       INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE: "/run/incomudon-private-control/client-ca.crt"
       INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV: "/run/incomudon-private-control/services.csv"
       INCOMUDON_PRIVATE_CONTROL_RELAY_ID: "${INCOMUDON_PRIVATE_CONTROL_RELAY_ID:-relay-local}"
+      INCOMUDON_PRIVATE_CONTROL_STATE_FILE: "/var/lib/incomudon-private-control/state.json"
     volumes:
       # The Relay can read, but cannot alter, Private Control Link credentials.
       - "${INCOMUDON_PRIVATE_CONTROL_DATA_DIR:-./private-control}:/run/incomudon-private-control:ro"
+      # Deny rules and completed command acknowledgements must survive restarts.
+      - "${INCOMUDON_PRIVATE_CONTROL_STATE_DIR:-./private-control-state}:/var/lib/incomudon-private-control"
     expose:
       - "9443"
     networks:

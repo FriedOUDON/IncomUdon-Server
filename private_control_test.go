@@ -70,14 +70,14 @@ func TestPrivateControlRevocationIsChannelScopedAndIdempotent(t *testing.T) {
 
 	link := newTestPrivateControlLink(t, s)
 	command := privateControlRevokeServiceAdmission{
-		SchemaVersion:  privateControlSchemaVersion,
-		Type:           "revoke_service_admission",
-		MessageID:      "MDEyMzQ1Njc4OTo7PD0-Pw",
-		ChannelID:      111,
-		ServiceID:      "recorder-01",
-		GrantIDHash:    base64.RawURLEncoding.EncodeToString(grantA[:]),
-		Reason:         "grant_revoked",
-		DenyForSeconds: 60,
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          "revoke_service_admission",
+		MessageID:     "MDEyMzQ1Njc4OTo7PD0-Pw",
+		ChannelID:     111,
+		ServiceID:     "recorder-01",
+		GrantIDHash:   base64.RawURLEncoding.EncodeToString(grantA[:]),
+		Reason:        "grant_revoked",
+		DenyUntil:     time.Now().Add(time.Minute).Unix(),
 	}
 	raw, err := json.Marshal(command)
 	if err != nil {
@@ -88,7 +88,7 @@ func TestPrivateControlRevocationIsChannelScopedAndIdempotent(t *testing.T) {
 		t.Fatal("valid revocation closed the private control session")
 	}
 	ack, ok := response.(privateControlAck)
-	if !ok || ack.Outcome != "applied" || ack.AffectedMembershipCount != 1 || ack.TalkReleaseCount != 1 {
+	if !ok || ack.Outcome != "applied" || ack.DenyUntil != command.DenyUntil || ack.AffectedMembershipCount != 1 || ack.TalkReleaseCount != 1 {
 		t.Fatalf("revocation acknowledgement = %#v", response)
 	}
 	release := receiveTestPacket(t, endpointA)
@@ -116,7 +116,7 @@ func TestPrivateControlRevocationIsChannelScopedAndIdempotent(t *testing.T) {
 		t.Fatalf("duplicate acknowledgement = %#v", repeated)
 	}
 
-	command.DenyForSeconds = 61
+	command.DenyUntil++
 	changedRaw, err := json.Marshal(command)
 	if err != nil {
 		t.Fatal(err)
@@ -127,12 +127,138 @@ func TestPrivateControlRevocationIsChannelScopedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestPrivateControlRevocationRestoresDurableIdempotency(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, true, false, false, 0, false, 1)
+	s.configureServiceAdmission(newTestServiceAdmissionState())
+	link := newTestPrivateControlLink(t, s)
+	command := privateControlRevokeServiceAdmission{
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          "revoke_service_admission",
+		MessageID:     "QkNERUZHSElKS0xNTk9QUQ",
+		ChannelID:     111,
+		ServiceID:     "recorder-01",
+		Reason:        "service_disabled",
+		DenyUntil:     time.Now().Add(time.Hour).Unix(),
+	}
+	raw, err := json.Marshal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, closeConnection := link.handleRevocation(&privateControlSession{serviceID: "management-main"}, raw, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: command.Type, MessageID: command.MessageID})
+	if closeConnection {
+		t.Fatal("initial durable revocation closed the session")
+	}
+	firstAck, ok := first.(privateControlAck)
+	if !ok || firstAck.Outcome != "applied" || firstAck.DenyUntil != command.DenyUntil {
+		t.Fatalf("initial durable acknowledgement = %#v", first)
+	}
+
+	restarted, err := newPrivateControlLink(s, link.policy, link.relayID, link.stateFile)
+	if err != nil {
+		t.Fatalf("recreate private control link: %v", err)
+	}
+	if err := restarted.restorePersistentState(time.Now()); err != nil {
+		t.Fatalf("restore private control state: %v", err)
+	}
+	repeated, closeConnection := restarted.handleRevocation(&privateControlSession{serviceID: "management-main"}, raw, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: command.Type, MessageID: command.MessageID})
+	if closeConnection {
+		t.Fatal("restored duplicate closed the session")
+	}
+	repeatedAck, ok := repeated.(privateControlAck)
+	if !ok || repeatedAck.MessageID != firstAck.MessageID || repeatedAck.DenyUntil != command.DenyUntil || repeatedAck.Outcome != "applied" {
+		t.Fatalf("restored duplicate acknowledgement = %#v", repeated)
+	}
+	rules := s.serviceAdmission.activeDenyRules(time.Now())
+	if len(rules) != 1 || rules[0].expiresAt.Unix() != command.DenyUntil {
+		t.Fatalf("restored deny rules = %#v", rules)
+	}
+}
+
+func TestPrivateControlRevocationDeadlineSemantics(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, true, false, false, 0, false, 1)
+	s.configureServiceAdmission(newTestServiceAdmissionState())
+	link := newTestPrivateControlLink(t, s)
+	session := &privateControlSession{serviceID: "management-main"}
+
+	expiredID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired := privateControlRevokeServiceAdmission{
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          "revoke_service_admission",
+		MessageID:     expiredID,
+		ChannelID:     111,
+		ServiceID:     "recorder-01",
+		Reason:        "grant_revoked",
+		DenyUntil:     time.Now().Add(-time.Minute).Unix(),
+	}
+	rawExpired, err := json.Marshal(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, closeConnection := link.handleRevocation(session, rawExpired, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: expired.Type, MessageID: expired.MessageID})
+	if closeConnection {
+		t.Fatal("expired revocation closed the session")
+	}
+	ack, ok := response.(privateControlAck)
+	if !ok || ack.Outcome != "already_expired" || ack.DenyUntil != expired.DenyUntil || ack.AffectedMembershipCount != 0 || ack.TalkReleaseCount != 0 {
+		t.Fatalf("expired revocation acknowledgement = %#v", response)
+	}
+
+	tooFarID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tooFar := expired
+	tooFar.MessageID = tooFarID
+	tooFar.DenyUntil = time.Now().Add(privateControlMaxDenyPeriod + time.Minute).Unix()
+	rawTooFar, err := json.Marshal(tooFar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, closeConnection = link.handleRevocation(session, rawTooFar, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: tooFar.Type, MessageID: tooFar.MessageID})
+	if closeConnection {
+		t.Fatal("invalid deadline closed the session")
+	}
+	protocolError, ok := response.(privateControlError)
+	if !ok || protocolError.Code != "invalid_revocation_deadline" {
+		t.Fatalf("invalid deadline response = %#v", response)
+	}
+}
+
+func TestManagedServiceIDGrammarIsSharedByPCL(t *testing.T) {
+	for _, serviceID := range []string{"recorder", "recorder-east", "recorder.east_01", "R1"} {
+		if !managedServiceIDPattern.MatchString(serviceID) {
+			t.Fatalf("valid Management Service ID rejected: %q", serviceID)
+		}
+	}
+	for _, serviceID := range []string{"", ".recorder", "_recorder", ":recorder", "recorder:east", "recorder east", string(make([]byte, 129))} {
+		if managedServiceIDPattern.MatchString(serviceID) {
+			t.Fatalf("invalid Management Service ID accepted: %q", serviceID)
+		}
+	}
+	value := true
+	invalidServiceID := "recorder:east"
+	if validPrivateControlHello(privateControlHello{SchemaVersion: privateControlSchemaVersion, Type: "hello", MessageID: "MDEyMzQ1Njc4OTo7PD0-Pw", ManagementServiceID: invalidServiceID, WantLifecycleEvents: &value, WantAuditInputs: &value, WantDiagnostics: &value}) {
+		t.Fatal("PCL hello accepted a noncanonical Management Service ID")
+	}
+	if _, valid := validPrivateControlRevocation(privateControlRevokeServiceAdmission{SchemaVersion: privateControlSchemaVersion, Type: "revoke_service_admission", MessageID: "MDEyMzQ1Njc4OTo7PD0-Pw", ChannelID: 111, ServiceID: invalidServiceID, Reason: "service_disabled", DenyUntil: time.Now().Add(time.Minute).Unix()}); valid {
+		t.Fatal("PCL revocation accepted a noncanonical Management Service ID")
+	}
+	if _, valid := validPrivateControlRevocation(privateControlRevokeServiceAdmission{SchemaVersion: privateControlSchemaVersion, Type: "revoke_service_admission", MessageID: "MDEyMzQ1Njc4OTo7PD0-Pw", ChannelID: 111, ServiceID: "recorder-01", Reason: "service_disabled", DenyUntil: 0}); valid {
+		t.Fatal("PCL revocation accepted a non-schema Unix timestamp")
+	}
+}
+
 func TestPrivateControlRevocationDenyRuleExpires(t *testing.T) {
 	state := newTestServiceAdmissionState()
 	grantIDHash := sha256.Sum256([]byte("grant-a"))
 	target := serviceAdmissionRevocationTarget{channelID: 111, serviceID: "recorder-01", grantIDHash: &grantIDHash}
 	now := time.Now()
-	if !state.installRevocation(target, time.Second, now) {
+	if !state.installRevocation(target, now.Add(time.Second), now) {
 		t.Fatal("install revocation deny rule")
 	}
 	admission := serviceAdmission{serviceID: "recorder-01", grantIDHash: grantIDHash}
@@ -162,7 +288,7 @@ func TestServiceMembershipAttachmentRejectsInstalledDenyRule(t *testing.T) {
 		codecConfigs:      make(map[uint32][]byte),
 		mediaCodecConfigs: make(map[uint32]codecConfigState),
 	}
-	if !state.installRevocation(serviceAdmissionRevocationTarget{channelID: 111, serviceID: "recorder-01", grantIDHash: &grantIDHash}, time.Minute, now) {
+	if !state.installRevocation(serviceAdmissionRevocationTarget{channelID: 111, serviceID: "recorder-01", grantIDHash: &grantIDHash}, now.Add(time.Minute), now) {
 		t.Fatal("install deny rule")
 	}
 	if s.setPeerServiceAdmission(111, 1001, address, admission) {

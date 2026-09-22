@@ -1958,6 +1958,7 @@ func main() {
 	privateControlClientCAFile := flag.String("private-control-client-ca-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE"), "Private Control Link trusted client CA PEM file")
 	privateControlServicesCSV := flag.String("private-control-services-csv", os.Getenv("INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV"), "Private Control Link authorized services CSV")
 	privateControlRelayID := flag.String("private-control-relay-id", os.Getenv("INCOMUDON_PRIVATE_CONTROL_RELAY_ID"), "Private Control Link opaque Relay identifier")
+	privateControlStateFile := flag.String("private-control-state-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_STATE_FILE"), "Private Control Link durable deny-rule and idempotency state file")
 	floorInterruptDefault := false
 	if raw := os.Getenv("INCOMUDON_FLOOR_INTERRUPT_ENABLED"); raw != "" {
 		if parsed, err := strconv.ParseBool(raw); err == nil {
@@ -2122,7 +2123,7 @@ func main() {
 		if _, err := startPrivateControlLink(srv, privateControlConfig{
 			listenAddress: *privateControlListen, certificateFile: *privateControlCertificateFile,
 			privateKeyFile: *privateControlPrivateKeyFile, clientCAFile: *privateControlClientCAFile,
-			servicesCSV: *privateControlServicesCSV, relayID: *privateControlRelayID, secretPermissions: secretPermissions,
+			servicesCSV: *privateControlServicesCSV, relayID: *privateControlRelayID, stateFile: *privateControlStateFile, secretPermissions: secretPermissions,
 		}); err != nil {
 			log.Fatalf("invalid Private Control Link configuration: %v", err)
 		}

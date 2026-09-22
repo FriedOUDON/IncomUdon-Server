@@ -94,6 +94,11 @@ type serviceAdmissionDenyRule struct {
 	hasGrantIDHash bool
 }
 
+type serviceAdmissionDenyRuleEntry struct {
+	rule      serviceAdmissionDenyRule
+	expiresAt time.Time
+}
+
 func (target serviceAdmissionRevocationTarget) matches(channelID uint32, admission serviceAdmission) bool {
 	if target.channelID != channelID {
 		return false
@@ -159,7 +164,9 @@ type serviceGrantClaims struct {
 	} `json:"cnf"`
 }
 
-var serviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+// managedServiceIDPattern is the canonical namespace shared by Service
+// Admission grants, Management CSVs, and PCL service-scoped revocations.
+var managedServiceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 var serviceGrantIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 
 func parseServiceAdmissionMode(value string) (serviceAdmissionMode, error) {
@@ -300,7 +307,7 @@ func (a *serviceAdmissionState) validateGrant(grant string, publicKey ed25519.Pu
 	if claims.Issuer != a.issuer || claims.Audience != a.audience || claims.ChannelID != channelID || claims.SenderID != senderID || claims.SenderID == 0 {
 		return serviceAdmission{}, serviceDenyScopeMismatch
 	}
-	if !serviceIDPattern.MatchString(claims.ServiceID) || !serviceGrantIDPattern.MatchString(claims.GrantID) {
+	if !managedServiceIDPattern.MatchString(claims.ServiceID) || !serviceGrantIDPattern.MatchString(claims.GrantID) {
 		return serviceAdmission{}, serviceDenyInvalidGrant
 	}
 	if claims.Permissions != 1 && claims.Permissions != 3 && claims.Permissions != 7 || claims.Permissions&identityPermissionListen == 0 {
@@ -378,6 +385,20 @@ func (a *serviceAdmissionState) cleanupLocked(now time.Time) {
 	}
 }
 
+func (a *serviceAdmissionState) activeDenyRules(now time.Time) []serviceAdmissionDenyRuleEntry {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cleanupLocked(now)
+	rules := make([]serviceAdmissionDenyRuleEntry, 0, len(a.denied))
+	for rule, expiresAt := range a.denied {
+		rules = append(rules, serviceAdmissionDenyRuleEntry{rule: rule, expiresAt: expiresAt})
+	}
+	return rules
+}
+
 func (a *serviceAdmissionState) deniedLocked(channelID uint32, admission serviceAdmission) bool {
 	for rule := range a.denied {
 		if rule.matches(channelID, admission) {
@@ -402,12 +423,12 @@ func (a *serviceAdmissionState) admissionAllowedForMembership(channelID uint32, 
 
 // installRevocation installs a channel-scoped deny rule before evicting pending
 // state. It returns false only when a new rule cannot fit in the bounded set.
-func (a *serviceAdmissionState) installRevocation(target serviceAdmissionRevocationTarget, duration time.Duration, now time.Time) bool {
-	if a == nil || duration <= 0 || (target.serviceID == "" && target.grantIDHash == nil) {
+func (a *serviceAdmissionState) installRevocation(target serviceAdmissionRevocationTarget, denyUntil time.Time, now time.Time) bool {
+	if a == nil || !denyUntil.After(now) || (target.serviceID == "" && target.grantIDHash == nil) {
 		return false
 	}
 	rule := target.denyRule()
-	expiresAt := now.Add(duration)
+	expiresAt := denyUntil
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cleanupLocked(now)

@@ -159,8 +159,10 @@ talk, or authentication state; zero remains reserved for Relay/System packets.
 
 ### Secret file handling
 
-All Relay configuration directories in `compose.yaml` and
-`compose.management.yaml` are bind-mounted read-only. The Relay also checks
+Relay credential directories in `compose.yaml` and `compose.management.yaml`
+are bind-mounted read-only. The Private Control Link state directory is the
+intentional exception: it is a separate Relay-only writable mount for durable
+deny rules and idempotency acknowledgements. The Relay also checks
 the private inputs it reads: Control Authentication keys and cookie secret,
 Directory channel-key CSV, Management Plane signing/TLS private keys, and
 Private Control Link TLS private key.
@@ -180,7 +182,7 @@ The container runs as UID/GID `10001`. On Linux hosts, make the secret
 directories private and give this account ownership before starting Compose:
 
 ```bash
-install -d -m 0700 -o 10001 -g 10001 control directory-v3 management private-control
+install -d -m 0700 -o 10001 -g 10001 control directory-v3 management private-control private-control-state
 chown 10001:10001 control/control-keys.csv control/cookie.secret \
   directory-v3/directory-keys.csv management/signing-key.csv management/server.key \
   private-control/server.key
@@ -308,8 +310,9 @@ go run . -port 50000
 
 The embedded Relay listener advertises `event_delivery: "live"` by default and
 `audit_retrieval: false`. It sends redacted SSE events only to currently
-connected authorized subscribers, does not retain replay history, rejects SSE
-cursors, and returns `404` for `/v1/audit-records`. Set
+connected authorized subscribers, does not retain replay history, ignores a
+standard SSE `Last-Event-ID` during reconnect, rejects an explicit `since`
+query parameter, and returns `404` for `/v1/audit-records`. Set
 `INCOMUDON_MANAGEMENT_EVENT_DELIVERY=disabled` to omit SSE entirely. A
 deployment that needs replay-capable SSE, Audit Retrieval, or durable
 recording/revocation integration must use an external Management Service behind
@@ -324,12 +327,13 @@ private administration network.
 
 This Relay implements the mTLS transport profile of Private Control Link v1.
 A Management Service starts a `private-control-link-v1` session with `hello`.
-The Relay independently accepts requested lifecycle-event and audit-input
-capabilities, then uses bounded, best-effort queues for redacted outbound
-notifications. It neither retains nor replays those notifications, and never
-assigns external SSE cursor IDs. A full queue drops the affected notification
-rather than delaying media forwarding; the Management Service owns any durable
-SSE or audit storage.
+The Relay independently accepts requested lifecycle-event, audit-input, and
+diagnostics capabilities, then uses bounded, best-effort queues for redacted
+outbound notifications. Diagnostics negotiation is mandatory in the `hello`
+wire shape; this Relay currently returns `diagnostics_accepted: false`. It
+neither retains nor replays those notifications, and never assigns external SSE
+cursor IDs. A full queue drops the affected notification rather than delaying
+media forwarding; the Management Service owns any durable SSE or audit storage.
 
 The Relay exports `participant_joined`, `participant_left`, `talk_started`,
 `talk_ended`, `service_admission_issued`, `service_admission_revoked`, and an
@@ -338,12 +342,20 @@ audit inputs are accepted, admission-identified Floor Interrupt requests also
 emit redacted `relay_audit_input` messages.
 
 The authenticated Management Service may send a channel-scoped
-`revoke_service_admission` command. The Relay installs its bounded deny rule
-before acknowledging it, removes only memberships matching every supplied
-target field, and releases matching active talkers with
-`SERVICE_ADMISSION_REVOKED`. Duplicate commands with the same `message_id` and
-body replay their cached acknowledgement for at least ten minutes; reuse of a
-message ID with a different body closes the link.
+`revoke_service_admission` command with an absolute UTC `deny_until` timestamp.
+The Relay installs its bounded deny rule before acknowledging it, removes only
+memberships matching every supplied target field, and releases matching active
+talkers with `SERVICE_ADMISSION_REVOKED`. An already elapsed deadline returns
+`already_expired`; a deadline more than 90 minutes ahead is rejected. Deny rules
+and duplicate-command acknowledgements are persisted before an `applied`
+acknowledgement is released, so the original acknowledgement and deadline are
+restored after a Relay restart. Reuse of a message ID with a different body
+closes the link.
+
+When Managed Service Admission is enabled, `INCOMUDON_PRIVATE_CONTROL_STATE_FILE`
+is required. Its parent directory must be writable only by the Relay and must
+not be the read-only credential directory. An event-export-only PCL deployment
+without Managed Service Admission does not require a state file.
 
 Authorize mTLS client certificates with a separate strict CSV policy file:
 
@@ -365,6 +377,7 @@ INCOMUDON_PRIVATE_CONTROL_KEY_FILE=./private-control/server.key \
 INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE=./private-control/client-ca.crt \
 INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV=./private-control/services.csv \
 INCOMUDON_PRIVATE_CONTROL_RELAY_ID=relay-production-east-1 \
+INCOMUDON_PRIVATE_CONTROL_STATE_FILE=./private-control-state/state.json \
 go run . -port 50000
 ```
 
@@ -381,7 +394,8 @@ health endpoints; it is not yet the full external Management Plane API. It
 does not persist, replay, or expose the received events outside the internal
 network.
 
-Prepare two distinct credential directories before starting the overlay:
+Prepare two credential directories and one writable Relay state directory
+before starting the overlay:
 
 ```text
 private-control/                 # mounted only into Relay
@@ -394,6 +408,9 @@ management-pcl/                  # mounted only into Management Service
   client.crt
   client.key
   relay-ca.crt
+
+private-control-state/           # writable only by the Relay (UID/GID 10001)
+  state.json                      # created automatically
 ```
 
 The certificate presented by the Management Service must chain to

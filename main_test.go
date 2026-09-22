@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -19,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -1536,11 +1538,55 @@ func TestEmbeddedManagementPlaneRejectsCursorsAndCanDisableEvents(t *testing.T) 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("live cursor status = %d", response.Code)
 	}
+	response = httptest.NewRecorder()
+	plane.handleEvents(response, httptest.NewRequest(http.MethodGet, "/v1/events?since=", nil), service)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("live empty cursor status = %d", response.Code)
+	}
 	plane.eventDelivery = managementEventDeliveryDisabled
 	response = httptest.NewRecorder()
 	plane.handleEvents(response, httptest.NewRequest(http.MethodGet, "/v1/events", nil), service)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("disabled event status = %d", response.Code)
+	}
+}
+
+func TestEmbeddedManagementPlaneLiveEventsIgnoreLastEventID(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, service, _ := newTestManagementPlane(t, s, "viewer")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	request := httptest.NewRequest(http.MethodGet, "/v1/events", nil).WithContext(ctx)
+	request.Header.Set("Last-Event-ID", "not-a-replay-cursor")
+	go func() {
+		plane.handleEvents(response, request, service)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		plane.mu.Lock()
+		subscribed := len(plane.subscribers) == 1
+		plane.mu.Unlock()
+		if subscribed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live event request with Last-Event-ID was not accepted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("live Last-Event-ID status = %d", response.Code)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("live event handler did not stop")
 	}
 }
 
@@ -1592,7 +1638,7 @@ func TestManagedServiceRevocationRemovesMembership(t *testing.T) {
 	now := time.Now()
 	s.configureServiceAdmission(&serviceAdmissionState{mode: serviceAdmissionEnabled, pending: make(map[serviceAdmissionKey]servicePendingAdmission), verified: make(map[serviceAdmissionKey]serviceAdmission), failed: make(map[serviceAdmissionKey]serviceAdmissionFailure), denied: make(map[serviceAdmissionDenyRule]time.Time)})
 	s.channels[100] = &channel{peers: map[string]*peer{peerMapKey(serviceAddr.LocalAddr().(*net.UDPAddr)): {addr: serviceAddr.LocalAddr().(*net.UDPAddr), senderId: 9001, membershipDeadline: now.Add(time.Minute), serviceAdmission: &serviceAdmission{serviceID: "recorder-01", permissions: identityPermissionListen | identityPermissionTalk, grantExpires: now.Add(time.Minute)}}}, activeTalkers: map[uint32]time.Time{9001: now}, codecConfigs: make(map[uint32][]byte), mediaCodecConfigs: make(map[uint32]codecConfigState)}
-	result, applied := s.revokeManagedServiceAdmission(serviceAdmissionRevocationTarget{channelID: 100, serviceID: "recorder-01"}, time.Minute, now)
+	result, applied := s.revokeManagedServiceAdmission(serviceAdmissionRevocationTarget{channelID: 100, serviceID: "recorder-01"}, now.Add(time.Minute), now)
 	if !applied || result.affectedMemberships != 1 || result.talkReleases != 1 {
 		t.Fatalf("revocation result = %+v, applied=%t", result, applied)
 	}
@@ -1607,7 +1653,7 @@ func newTestPrivateControlLink(t *testing.T, server *server) *privateControlLink
 	t.Helper()
 	link, err := newPrivateControlLink(server, privateControlPolicy{byCertificate: map[string]string{
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "management-main",
-	}}, "relay-test")
+	}}, "relay-test", filepath.Join(t.TempDir(), "private-control-state.json"))
 	if err != nil {
 		t.Fatalf("new private control link: %v", err)
 	}
@@ -1787,7 +1833,7 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	server := newServer(relay, false, false, false, 0, false, 1)
 	server.configureServiceAdmission(&serviceAdmissionState{mode: serviceAdmissionEnabled, pending: make(map[serviceAdmissionKey]servicePendingAdmission), verified: make(map[serviceAdmissionKey]serviceAdmission), failed: make(map[serviceAdmissionKey]serviceAdmissionFailure), denied: make(map[serviceAdmissionDenyRule]time.Time)})
 	serverConfig, clientConfig, clientDigest := newPrivateControlTestTLSConfigs(t)
-	link, err := newPrivateControlLink(server, privateControlPolicy{byCertificate: map[string]string{clientDigest: "management-main"}}, "relay-test")
+	link, err := newPrivateControlLink(server, privateControlPolicy{byCertificate: map[string]string{clientDigest: "management-main"}}, "relay-test", filepath.Join(t.TempDir(), "private-control-state.json"))
 	if err != nil {
 		t.Fatalf("new private control link: %v", err)
 	}
@@ -1813,7 +1859,7 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello ID: %v", err)
 	}
-	wantEvents, wantAuditInputs := true, true
+	wantEvents, wantAuditInputs, wantDiagnostics := true, true, true
 	if err := writePrivateControlFrame(client, privateControlHello{
 		SchemaVersion:       privateControlSchemaVersion,
 		Type:                "hello",
@@ -1821,6 +1867,7 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 		ManagementServiceID: "management-main",
 		WantLifecycleEvents: &wantEvents,
 		WantAuditInputs:     &wantAuditInputs,
+		WantDiagnostics:     &wantDiagnostics,
 	}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
@@ -1832,7 +1879,7 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	if err := decodePrivateControlJSON(rawAck, &ack); err != nil {
 		t.Fatalf("decode hello_ack: %v", err)
 	}
-	if ack.Type != "hello_ack" || ack.InReplyTo != helloID || ack.RelayID != "relay-test" || !ack.LifecycleEventsAccepted || !ack.AuditInputsAccepted {
+	if ack.Type != "hello_ack" || ack.InReplyTo != helloID || ack.RelayID != "relay-test" || !ack.LifecycleEventsAccepted || !ack.AuditInputsAccepted || ack.DiagnosticsAccepted {
 		t.Fatalf("unexpected hello_ack: %+v", ack)
 	}
 	rawHealth, err := readPrivateControlFrame(client)
@@ -1849,14 +1896,14 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 
 	grantIDHash := sha256.Sum256([]byte("private-control-test-grant"))
 	revocation := privateControlRevokeServiceAdmission{
-		SchemaVersion:  privateControlSchemaVersion,
-		Type:           "revoke_service_admission",
-		MessageID:      "MDEyMzQ1Njc4OTo7PD0-Pw",
-		ChannelID:      111,
-		ServiceID:      "recorder-01",
-		GrantIDHash:    base64.RawURLEncoding.EncodeToString(grantIDHash[:]),
-		Reason:         "grant_revoked",
-		DenyForSeconds: 60,
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          "revoke_service_admission",
+		MessageID:     "MDEyMzQ1Njc4OTo7PD0-Pw",
+		ChannelID:     111,
+		ServiceID:     "recorder-01",
+		GrantIDHash:   base64.RawURLEncoding.EncodeToString(grantIDHash[:]),
+		Reason:        "grant_revoked",
+		DenyUntil:     time.Now().Add(time.Minute).Unix(),
 	}
 	if err := writePrivateControlFrame(client, revocation); err != nil {
 		t.Fatalf("write revocation: %v", err)
@@ -1869,7 +1916,7 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	if err := decodePrivateControlJSON(rawRevocationAck, &revocationAck); err != nil {
 		t.Fatalf("decode revocation ack: %v", err)
 	}
-	if revocationAck.Type != "ack" || revocationAck.InReplyTo != revocation.MessageID || revocationAck.Outcome != "applied" || revocationAck.AffectedMembershipCount != 0 || revocationAck.TalkReleaseCount != 0 {
+	if revocationAck.Type != "ack" || revocationAck.InReplyTo != revocation.MessageID || revocationAck.Outcome != "applied" || revocationAck.DenyUntil != revocation.DenyUntil || revocationAck.AffectedMembershipCount != 0 || revocationAck.TalkReleaseCount != 0 {
 		t.Fatalf("unexpected revocation ack: %+v", revocationAck)
 	}
 }

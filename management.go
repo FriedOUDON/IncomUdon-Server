@@ -164,7 +164,6 @@ type managementPlane struct {
 	cursorKey      [32]byte
 }
 
-var managementServiceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 var managementHexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var managementActionPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
@@ -237,7 +236,7 @@ func loadManagementPolicy(servicesPath string, aclPath string, globalPermissions
 		return managementPolicy{}, fmt.Errorf("management-services.csv: %w", err)
 	}
 	for index, row := range services {
-		if !managementServiceIDPattern.MatchString(row[0]) || !managementHexPattern.MatchString(row[1]) {
+		if !managedServiceIDPattern.MatchString(row[0]) || !managementHexPattern.MatchString(row[1]) {
 			return managementPolicy{}, fmt.Errorf("management-services.csv row %d has invalid service ID or certificate digest", index+2)
 		}
 		if row[2] != "viewer" && row[2] != "recorder" && row[2] != "operator" && row[2] != "auditor" && row[2] != "admin" {
@@ -633,7 +632,9 @@ func (p *managementPlane) handleEvents(w http.ResponseWriter, r *http.Request, s
 		http.NotFound(w, r)
 		return
 	}
-	if r.Header.Get("Last-Event-ID") != "" || r.URL.Query().Get("since") != "" {
+	// EventSource reconnects may add Last-Event-ID even for live-only streams.
+	// Live delivery ignores it, while an explicitly supplied since is unsupported.
+	if _, hasSince := r.URL.Query()["since"]; hasSince {
 		http.Error(w, "event cursors are unavailable for live delivery", http.StatusBadRequest)
 		return
 	}
@@ -1065,8 +1066,8 @@ type managedServiceRevocationResult struct {
 // channel-scoped Private Control Link revocation. The deny rule is installed
 // before existing memberships are removed so a racing admission flow fails
 // closed.
-func (s *server) revokeManagedServiceAdmission(target serviceAdmissionRevocationTarget, denyFor time.Duration, now time.Time) (managedServiceRevocationResult, bool) {
-	if s.serviceAdmission == nil || !s.serviceAdmission.installRevocation(target, denyFor, now) {
+func (s *server) revokeManagedServiceAdmission(target serviceAdmissionRevocationTarget, denyUntil time.Time, now time.Time) (managedServiceRevocationResult, bool) {
+	if s.serviceAdmission == nil || !s.serviceAdmission.installRevocation(target, denyUntil, now) {
 		return managedServiceRevocationResult{}, false
 	}
 	type revokedPeer struct {
