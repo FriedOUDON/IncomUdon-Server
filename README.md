@@ -165,7 +165,7 @@ intentional exception: it is a separate Relay-only writable mount for durable
 deny rules and idempotency acknowledgements. The Relay also checks
 the private inputs it reads: Control Authentication keys and cookie secret,
 Directory channel-key CSV, Management Plane signing/TLS private keys, and
-Private Control Link TLS private key.
+the Private Control Link TLS private key when the mTLS TCP profile is selected.
 
 `INCOMUDON_SECRET_FILE_PERMISSIONS` (or `-secret-file-permissions`) controls
 the startup check:
@@ -184,12 +184,14 @@ directories private and give this account ownership before starting Compose:
 ```bash
 install -d -m 0700 -o 10001 -g 10001 control directory-v3 management private-control private-control-state
 chown 10001:10001 control/control-keys.csv control/cookie.secret \
-  directory-v3/directory-keys.csv management/signing-key.csv management/server.key \
-  private-control/server.key
+  directory-v3/directory-keys.csv management/signing-key.csv management/server.key
 chmod 0600 control/control-keys.csv control/cookie.secret \
-  directory-v3/directory-keys.csv management/signing-key.csv management/server.key \
-  private-control/server.key
+  directory-v3/directory-keys.csv management/signing-key.csv management/server.key
 ```
+
+For the optional PCL mTLS TCP profile, protect `private-control/server.key`
+with the same owner and `0600` mode. The bundled UDS profile has no PCL private
+key; its socket volume is initialized separately by Compose.
 
 Docker Desktop bind mounts on Windows do not reliably preserve Unix mode bits.
 For local Windows development, set `INCOMUDON_SECRET_FILE_PERMISSIONS=warn`.
@@ -320,12 +322,13 @@ the private management boundary.
 
 ### Private Control Link Event Export
 
-The optional Private Control Link is a second, dedicated TLS 1.3 mTLS TCP
+The optional Private Control Link is a dedicated authenticated Relay-control
 listener for a Management Service. It is distinct from the Management Plane
-HTTPS API and **must** use a different listener address. Bind it only to a
-private administration network.
+HTTPS API. This Relay implements the Linux UDS peer-credential and mTLS TCP
+profiles of Private Control Link v1; choose exactly one at startup. UDS is the
+recommended same-host profile, while mTLS TCP must use a separate private
+listener address for cross-host deployments.
 
-This Relay implements the mTLS transport profile of Private Control Link v1.
 A Management Service starts a `private-control-link-v1` session with `hello`.
 The Relay independently accepts requested lifecycle-event, audit-input, and
 diagnostics capabilities, then uses bounded, best-effort queues for redacted
@@ -360,7 +363,39 @@ is required. Its parent directory must be writable only by the Relay and must
 not be the read-only credential directory. An event-export-only PCL deployment
 without Managed Service Admission does not require a state file.
 
-Authorize mTLS client certificates with a separate strict CSV policy file:
+Set `INCOMUDON_PRIVATE_CONTROL_TRANSPORT` to exactly one profile. The Relay
+does not fall back between profiles.
+
+For same-host deployments, `uds` is the recommended profile. The Relay derives
+the Management Service identity from Linux `SO_PEERCRED`; the `hello`
+`management_service_id` is only a consistency check. Map each non-root
+Management Service UID with a separate strict CSV policy file:
+
+```csv
+management_service_id,uid,enabled
+management-main,10002,true
+```
+
+The socket directory must be Relay-owned, non-symlinked, and neither group- nor
+world-writable. The Relay creates `relay.sock` with mode `0660` and the
+configured shared group. The Management Service needs group write access to the
+socket, but must not be able to modify its parent directory. The UDS profile is
+available only on Linux; deployments without reliable peer credentials must use
+the mTLS TCP profile instead.
+
+```bash
+INCOMUDON_PRIVATE_CONTROL_ENABLED=true \
+INCOMUDON_PRIVATE_CONTROL_TRANSPORT=uds \
+INCOMUDON_PRIVATE_CONTROL_UDS_SOCKET_PATH=/run/incomudon-pcl/relay.sock \
+INCOMUDON_PRIVATE_CONTROL_UDS_SOCKET_GROUP=10003 \
+INCOMUDON_PRIVATE_CONTROL_UDS_SERVICES_CSV=./private-control/uds-services.csv \
+INCOMUDON_PRIVATE_CONTROL_RELAY_ID=relay-production-east-1 \
+INCOMUDON_PRIVATE_CONTROL_STATE_FILE=./private-control-state/state.json \
+go run . -port 50000
+```
+
+For a Management Service on another host, use `mtls-tcp` and authorize client
+certificates with a separate strict CSV policy file:
 
 ```csv
 management_service_id,certificate_sha256,enabled
@@ -374,6 +409,7 @@ must match this certificate mapping. An example is available at
 
 ```bash
 INCOMUDON_PRIVATE_CONTROL_ENABLED=true \
+INCOMUDON_PRIVATE_CONTROL_TRANSPORT=mtls-tcp \
 INCOMUDON_PRIVATE_CONTROL_LISTEN=127.0.0.1:9443 \
 INCOMUDON_PRIVATE_CONTROL_CERT_FILE=./private-control/server.crt \
 INCOMUDON_PRIVATE_CONTROL_KEY_FILE=./private-control/server.key \
@@ -388,39 +424,33 @@ go run . -port 50000
 
 `compose.management.yaml` starts the separately built Management Service image
 alongside the Relay, while keeping the source repositories and container
-privileges separate. It enables the Relay's Private Control Link and connects
-the two containers only through an internal Docker network. The Relay's UDP
-media port remains the only port published by the base Compose file.
+privileges separate. It uses the UDS profile by default: the PCL has no TCP
+port, and the Relay's UDP media port remains the only port published by the
+base Compose file.
 
 The initial Management Service image is a P1 live-event consumer with internal
 health endpoints; it is not yet the full external Management Plane API. It
 does not persist, replay, or expose the received events outside the internal
 network.
 
-Prepare two credential directories and one writable Relay state directory
-before starting the overlay:
+Prepare the UDS service policy and writable Relay state directory before
+starting the overlay:
 
 ```text
-private-control/                 # mounted only into Relay
-  server.crt
-  server.key
-  client-ca.crt
-  services.csv
-
-management-pcl/                  # mounted only into Management Service
-  client.crt
-  client.key
-  relay-ca.crt
+private-control/                 # read-only in the Relay
+  uds-services.csv
 
 private-control-state/           # writable only by the Relay (UID/GID 10001)
   state.json                      # created automatically
 ```
 
-The certificate presented by the Management Service must chain to
-`private-control/client-ca.crt`; its DER SHA-256 fingerprint maps to the same
-`INCOMUDON_MANAGEMENT_PCL_SERVICE_ID` in `private-control/services.csv`. The
-Relay server certificate must contain `relay` (or the configured
-`INCOMUDON_MANAGEMENT_PCL_SERVER_NAME`) as a DNS SAN.
+The overlay's one-shot `private-control-socket-init` service initializes the
+shared volume as `10001:10003` with mode `0750`. Relay runs as UID `10001` and
+creates the socket for group `10003`; the Management Service runs as UID
+`10002` with that supplementary group. Keep these IDs and the
+`uds-services.csv` mapping aligned. The shared socket volume is read-write so
+the Management Service can connect, but it contains no credentials and its
+directory is not writable by that service.
 
 After copying the required configuration from `.env.example`, start both
 containers together:

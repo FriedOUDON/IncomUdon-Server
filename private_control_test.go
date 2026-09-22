@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -250,6 +252,43 @@ func TestManagedServiceIDGrammarIsSharedByPCL(t *testing.T) {
 	}
 	if _, valid := validPrivateControlRevocation(privateControlRevokeServiceAdmission{SchemaVersion: privateControlSchemaVersion, Type: "revoke_service_admission", MessageID: "MDEyMzQ1Njc4OTo7PD0-Pw", ChannelID: 111, ServiceID: "recorder-01", Reason: "service_disabled", DenyUntil: 0}); valid {
 		t.Fatal("PCL revocation accepted a non-schema Unix timestamp")
+	}
+}
+
+func TestPrivateControlUDSPolicyRequiresCanonicalUniqueNonRootUIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private-control-uds-services.csv")
+	if err := os.WriteFile(path, []byte("management_service_id,uid,enabled\nmanagement-main,10002,true\nmanagement-disabled,10003,false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := loadPrivateControlUDSPolicy(path)
+	if err != nil {
+		t.Fatalf("load UDS policy: %v", err)
+	}
+	if policy.byUID[10002] != "management-main" {
+		t.Fatalf("enabled UDS policy mapping = %#v", policy.byUID)
+	}
+	if _, found := policy.byUID[10003]; found {
+		t.Fatalf("disabled UDS policy mapping = %#v", policy.byUID)
+	}
+
+	if err := os.WriteFile(path, []byte("management_service_id,uid,enabled\nmanagement-main,0,true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPrivateControlUDSPolicy(path); err == nil {
+		t.Fatal("UDS policy accepted root UID")
+	}
+	if err := os.WriteFile(path, []byte("management_service_id,uid,enabled\nmanagement-main,10002,true\nmanagement-other,10002,true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPrivateControlUDSPolicy(path); err == nil {
+		t.Fatal("UDS policy accepted duplicate UID")
+	}
+}
+
+func TestPrivateControlRequiresExplicitTransport(t *testing.T) {
+	relay := newTestUDPConn(t)
+	if _, err := startPrivateControlLink(newServer(relay, false, false, false, 0, false, 1), privateControlConfig{relayID: "relay-test"}); err == nil {
+		t.Fatal("private control link accepted an unspecified transport")
 	}
 }
 

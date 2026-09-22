@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,8 @@ import (
 
 const (
 	privateControlSchemaVersion                = "private-control-link-v1"
+	privateControlTransportMTLSTCP             = "mtls-tcp"
+	privateControlTransportUDS                 = "uds"
 	privateControlMaxFrameBytes                = 65536
 	privateControlMaxJSONInteger         int64 = 9007199254740991
 	privateControlSessionQueueDepth            = 256
@@ -46,11 +49,15 @@ const (
 )
 
 type privateControlConfig struct {
+	transport         string
 	listenAddress     string
 	certificateFile   string
 	privateKeyFile    string
 	clientCAFile      string
 	servicesCSV       string
+	udsSocketPath     string
+	udsSocketGroup    string
+	udsServicesCSV    string
 	relayID           string
 	stateFile         string
 	secretPermissions secretFilePermissionPolicy
@@ -58,12 +65,16 @@ type privateControlConfig struct {
 
 type privateControlPolicy struct {
 	byCertificate map[string]string
+	byUID         map[uint32]string
 }
+
+type privateControlConnectionAuthenticator func(net.Conn, privateControlPolicy) (net.Conn, string, error)
 
 type privateControlLink struct {
 	server       *server
 	relayID      string
 	policy       privateControlPolicy
+	authenticate privateControlConnectionAuthenticator
 	mu           sync.Mutex
 	sessions     map[string]*privateControlSession
 	dropped      uint64
@@ -262,12 +273,51 @@ func loadPrivateControlPolicy(path string) (privateControlPolicy, error) {
 	return policy, nil
 }
 
+func loadPrivateControlUDSPolicy(path string) (privateControlPolicy, error) {
+	if strings.TrimSpace(path) == "" {
+		return privateControlPolicy{}, errors.New("private control UDS services CSV is required")
+	}
+	rows, err := strictCSVRows(path, []string{"management_service_id", "uid", "enabled"})
+	if err != nil {
+		return privateControlPolicy{}, err
+	}
+	policy := privateControlPolicy{byUID: make(map[uint32]string)}
+	byService := make(map[string]struct{})
+	byUID := make(map[uint32]struct{})
+	for index, row := range rows {
+		uid, err := strconv.ParseUint(row[1], 10, 32)
+		if !managedServiceIDPattern.MatchString(row[0]) || err != nil || uid == 0 {
+			return privateControlPolicy{}, fmt.Errorf("private control UDS services CSV row %d is invalid", index+2)
+		}
+		enabled, err := parseManagementBool(row[2])
+		if err != nil {
+			return privateControlPolicy{}, fmt.Errorf("private control UDS services CSV row %d enabled: %w", index+2, err)
+		}
+		uid32 := uint32(uid)
+		if _, exists := byService[row[0]]; exists {
+			return privateControlPolicy{}, fmt.Errorf("private control UDS services CSV row %d duplicates management_service_id", index+2)
+		}
+		if _, exists := byUID[uid32]; exists {
+			return privateControlPolicy{}, fmt.Errorf("private control UDS services CSV row %d duplicates uid", index+2)
+		}
+		byService[row[0]] = struct{}{}
+		byUID[uid32] = struct{}{}
+		if enabled {
+			policy.byUID[uid32] = row[0]
+		}
+	}
+	if len(policy.byUID) == 0 {
+		return privateControlPolicy{}, errors.New("private control UDS services CSV has no enabled service")
+	}
+	return policy, nil
+}
+
 func newPrivateControlLink(server *server, policy privateControlPolicy, relayID string, stateFile string) (*privateControlLink, error) {
-	if server == nil || strings.TrimSpace(relayID) == "" || len(relayID) > 128 || len(policy.byCertificate) == 0 {
+	if server == nil || strings.TrimSpace(relayID) == "" || len(relayID) > 128 || (len(policy.byCertificate) == 0 && len(policy.byUID) == 0) {
 		return nil, errors.New("invalid private control link configuration")
 	}
 	return &privateControlLink{
-		server: server, relayID: relayID, policy: policy, stateFile: stateFile, sessions: make(map[string]*privateControlSession),
+		server: server, relayID: relayID, policy: policy, authenticate: authenticatePrivateControlMTLSConnection, stateFile: stateFile, sessions: make(map[string]*privateControlSession),
 		failures: make(map[string]privateControlFailureState), idempotency: make(map[privateControlIdempotencyKey]*privateControlIdempotencyEntry),
 		commandSlots: make(chan struct{}, privateControlMaxCommands), connections: make(chan struct{}, privateControlMaxConnections),
 	}, nil
@@ -751,24 +801,46 @@ func newPrivateControlLifecycleEvent(eventType string, channelID *uint32, sender
 }
 
 func (l *privateControlLink) startListener(config privateControlConfig) error {
-	if err := validateSecretFilePermissions(config.privateKeyFile, "Private Control Link TLS private key", config.secretPermissions); err != nil {
+	var (
+		listener net.Listener
+		err      error
+	)
+	switch config.transport {
+	case privateControlTransportMTLSTCP:
+		listener, err = startPrivateControlMTLSListener(config)
+		l.authenticate = authenticatePrivateControlMTLSConnection
+	case privateControlTransportUDS:
+		listener, err = startPrivateControlUDSListener(config)
+		l.authenticate = authenticatePrivateControlUDSConnection
+	default:
+		return fmt.Errorf("unsupported private control transport %q", config.transport)
+	}
+	if err != nil {
 		return err
+	}
+	go l.acceptLoop(listener)
+	return nil
+}
+
+func startPrivateControlMTLSListener(config privateControlConfig) (net.Listener, error) {
+	if err := validateSecretFilePermissions(config.privateKeyFile, "Private Control Link TLS private key", config.secretPermissions); err != nil {
+		return nil, err
 	}
 	certificate, err := tls.LoadX509KeyPair(config.certificateFile, config.privateKeyFile)
 	if err != nil {
-		return fmt.Errorf("load private control server certificate: %w", err)
+		return nil, fmt.Errorf("load private control server certificate: %w", err)
 	}
 	caData, err := os.ReadFile(config.clientCAFile)
 	if err != nil {
-		return fmt.Errorf("read private control client CA: %w", err)
+		return nil, fmt.Errorf("read private control client CA: %w", err)
 	}
 	clientCAs := x509.NewCertPool()
 	if !clientCAs.AppendCertsFromPEM(caData) {
-		return errors.New("private control client CA contains no certificates")
+		return nil, errors.New("private control client CA contains no certificates")
 	}
 	listener, err := net.Listen("tcp", config.listenAddress)
 	if err != nil {
-		return fmt.Errorf("private control listener: %w", err)
+		return nil, fmt.Errorf("private control listener: %w", err)
 	}
 	tlsListener := tls.NewListener(listener, &tls.Config{
 		MinVersion:   privateControlTLSMinVersion,
@@ -776,8 +848,7 @@ func (l *privateControlLink) startListener(config privateControlConfig) error {
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    clientCAs,
 	})
-	go l.acceptLoop(tlsListener)
-	return nil
+	return tlsListener, nil
 }
 
 func (l *privateControlLink) acceptLoop(listener net.Listener) {
@@ -798,17 +869,24 @@ func (l *privateControlLink) acceptLoop(listener net.Listener) {
 	}
 }
 
-func privateControlServiceForConnection(connection *tls.Conn, policy privateControlPolicy) (string, error) {
+func authenticatePrivateControlMTLSConnection(rawConnection net.Conn, policy privateControlPolicy) (net.Conn, string, error) {
+	connection, ok := rawConnection.(*tls.Conn)
+	if !ok {
+		return nil, "", errors.New("private control mTLS listener returned a non-TLS connection")
+	}
+	if err := connection.Handshake(); err != nil {
+		return nil, "", fmt.Errorf("private control TLS handshake: %w", err)
+	}
 	state := connection.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		return "", errors.New("private control client certificate is missing")
+		return nil, "", errors.New("private control client certificate is missing")
 	}
 	digest := sha256.Sum256(state.PeerCertificates[0].Raw)
 	serviceID, found := policy.byCertificate[hex.EncodeToString(digest[:])]
 	if !found {
-		return "", errors.New("private control client certificate is not authorized")
+		return nil, "", errors.New("private control client certificate is not authorized")
 	}
-	return serviceID, nil
+	return connection, serviceID, nil
 }
 
 func validPrivateControlHello(message privateControlHello) bool {
@@ -966,24 +1044,20 @@ func (l *privateControlLink) handleRelayDiagnostics(session *privateControlSessi
 
 func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 	defer rawConnection.Close()
-	connection, ok := rawConnection.(*tls.Conn)
-	if !ok {
-		return
-	}
-	source := privateControlFailureSource(connection)
+	source := privateControlFailureSource(rawConnection)
 	if !l.allowConnectionAttempt(source, time.Now()) {
 		return
 	}
-	if err := connection.SetDeadline(time.Now().Add(privateControlHelloDeadline)); err != nil {
+	if err := rawConnection.SetDeadline(time.Now().Add(privateControlHelloDeadline)); err != nil {
 		return
 	}
-	if err := connection.Handshake(); err != nil {
-		l.recordConnectionFailure(source, "handshake")
+	if l.authenticate == nil {
+		l.recordConnectionFailure(source, "transport")
 		return
 	}
-	serviceID, err := privateControlServiceForConnection(connection, l.policy)
+	connection, serviceID, err := l.authenticate(rawConnection, l.policy)
 	if err != nil {
-		l.recordConnectionFailure(source, "authorization")
+		l.recordConnectionFailure(source, "transport")
 		return
 	}
 	rawHello, err := readPrivateControlFrame(connection)
@@ -1134,16 +1208,33 @@ func (l *privateControlLink) writeSession(connection net.Conn, session *privateC
 }
 
 func startPrivateControlLink(server *server, config privateControlConfig) (*privateControlLink, error) {
-	if strings.TrimSpace(config.listenAddress) == "" || strings.TrimSpace(config.certificateFile) == "" ||
-		strings.TrimSpace(config.privateKeyFile) == "" || strings.TrimSpace(config.clientCAFile) == "" ||
-		strings.TrimSpace(config.servicesCSV) == "" || strings.TrimSpace(config.relayID) == "" {
-		return nil, errors.New("private control listener, TLS certificate/key, client CA, services CSV, and relay ID are required")
+	if strings.TrimSpace(config.relayID) == "" {
+		return nil, errors.New("private control relay ID is required")
 	}
 	revocationEnabled := server != nil && server.serviceAdmission != nil && server.serviceAdmission.mode != serviceAdmissionOff
 	if revocationEnabled && strings.TrimSpace(config.stateFile) == "" {
 		return nil, errors.New("private control state file is required when managed service admission is enabled")
 	}
-	policy, err := loadPrivateControlPolicy(config.servicesCSV)
+	var (
+		policy privateControlPolicy
+		err    error
+	)
+	switch config.transport {
+	case privateControlTransportMTLSTCP:
+		if strings.TrimSpace(config.listenAddress) == "" || strings.TrimSpace(config.certificateFile) == "" ||
+			strings.TrimSpace(config.privateKeyFile) == "" || strings.TrimSpace(config.clientCAFile) == "" ||
+			strings.TrimSpace(config.servicesCSV) == "" {
+			return nil, errors.New("private control mTLS listener, certificate/key, client CA, and services CSV are required")
+		}
+		policy, err = loadPrivateControlPolicy(config.servicesCSV)
+	case privateControlTransportUDS:
+		if strings.TrimSpace(config.udsSocketPath) == "" || strings.TrimSpace(config.udsSocketGroup) == "" || strings.TrimSpace(config.udsServicesCSV) == "" {
+			return nil, errors.New("private control UDS socket path, socket group, and services CSV are required")
+		}
+		policy, err = loadPrivateControlUDSPolicy(config.udsServicesCSV)
+	default:
+		return nil, fmt.Errorf("private control transport must be %q or %q", privateControlTransportUDS, privateControlTransportMTLSTCP)
+	}
 	if err != nil {
 		return nil, err
 	}

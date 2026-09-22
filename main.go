@@ -1959,12 +1959,16 @@ func main() {
 			log.Printf("invalid INCOMUDON_PRIVATE_CONTROL_ENABLED=%q (using false)", raw)
 		}
 	}
-	privateControlEnabled := flag.Bool("private-control-enabled", privateControlEnabledDefault, "enable the Private Control Link v1 mTLS listener")
-	privateControlListen := flag.String("private-control-listen", os.Getenv("INCOMUDON_PRIVATE_CONTROL_LISTEN"), "Private Control Link mTLS listen address")
+	privateControlEnabled := flag.Bool("private-control-enabled", privateControlEnabledDefault, "enable the Private Control Link v1 listener")
+	privateControlTransport := flag.String("private-control-transport", os.Getenv("INCOMUDON_PRIVATE_CONTROL_TRANSPORT"), "Private Control Link transport: uds or mtls-tcp")
+	privateControlListen := flag.String("private-control-listen", os.Getenv("INCOMUDON_PRIVATE_CONTROL_LISTEN"), "Private Control Link mTLS TCP listen address")
 	privateControlCertificateFile := flag.String("private-control-cert-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_CERT_FILE"), "Private Control Link server certificate PEM file")
 	privateControlPrivateKeyFile := flag.String("private-control-key-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_KEY_FILE"), "Private Control Link server private key PEM file")
 	privateControlClientCAFile := flag.String("private-control-client-ca-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE"), "Private Control Link trusted client CA PEM file")
 	privateControlServicesCSV := flag.String("private-control-services-csv", os.Getenv("INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV"), "Private Control Link authorized services CSV")
+	privateControlUDSSocketPath := flag.String("private-control-uds-socket-path", os.Getenv("INCOMUDON_PRIVATE_CONTROL_UDS_SOCKET_PATH"), "Private Control Link UDS absolute socket path")
+	privateControlUDSSocketGroup := flag.String("private-control-uds-socket-group", os.Getenv("INCOMUDON_PRIVATE_CONTROL_UDS_SOCKET_GROUP"), "Private Control Link UDS socket numeric group ID")
+	privateControlUDSServicesCSV := flag.String("private-control-uds-services-csv", os.Getenv("INCOMUDON_PRIVATE_CONTROL_UDS_SERVICES_CSV"), "Private Control Link UDS authorized services CSV")
 	privateControlRelayID := flag.String("private-control-relay-id", os.Getenv("INCOMUDON_PRIVATE_CONTROL_RELAY_ID"), "Private Control Link opaque Relay identifier")
 	privateControlStateFile := flag.String("private-control-state-file", os.Getenv("INCOMUDON_PRIVATE_CONTROL_STATE_FILE"), "Private Control Link durable deny-rule and idempotency state file")
 	floorInterruptDefault := false
@@ -2125,17 +2129,24 @@ func main() {
 		log.Printf("Management Plane HTTPS listener enabled at %s", *managementListen)
 	}
 	if *privateControlEnabled {
-		if *managementEnabled && strings.TrimSpace(*privateControlListen) == strings.TrimSpace(*managementListen) {
+		if *privateControlTransport == privateControlTransportMTLSTCP && *managementEnabled && strings.TrimSpace(*privateControlListen) == strings.TrimSpace(*managementListen) {
 			log.Fatal("private-control-listen must be distinct from management-listen")
 		}
 		if _, err := startPrivateControlLink(srv, privateControlConfig{
-			listenAddress: *privateControlListen, certificateFile: *privateControlCertificateFile,
-			privateKeyFile: *privateControlPrivateKeyFile, clientCAFile: *privateControlClientCAFile,
-			servicesCSV: *privateControlServicesCSV, relayID: *privateControlRelayID, stateFile: *privateControlStateFile, secretPermissions: secretPermissions,
+			transport: *privateControlTransport, listenAddress: *privateControlListen,
+			certificateFile: *privateControlCertificateFile, privateKeyFile: *privateControlPrivateKeyFile,
+			clientCAFile: *privateControlClientCAFile, servicesCSV: *privateControlServicesCSV,
+			udsSocketPath: *privateControlUDSSocketPath, udsSocketGroup: *privateControlUDSSocketGroup,
+			udsServicesCSV: *privateControlUDSServicesCSV, relayID: *privateControlRelayID,
+			stateFile: *privateControlStateFile, secretPermissions: secretPermissions,
 		}); err != nil {
 			log.Fatalf("invalid Private Control Link configuration: %v", err)
 		}
-		log.Printf("Private Control Link mTLS listener enabled at %s", *privateControlListen)
+		if *privateControlTransport == privateControlTransportUDS {
+			log.Printf("Private Control Link UDS listener enabled at %s", *privateControlUDSSocketPath)
+		} else {
+			log.Printf("Private Control Link mTLS listener enabled at %s", *privateControlListen)
+		}
 	}
 
 	mode := "encrypted"

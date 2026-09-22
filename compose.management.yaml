@@ -1,22 +1,40 @@
 services:
+  private-control-socket-init:
+    image: alpine:3.19
+    command:
+      - sh
+      - -ec
+      - >-
+        mkdir -p /run/incomudon-pcl &&
+        chown 10001:10003 /run/incomudon-pcl &&
+        chmod 0750 /run/incomudon-pcl
+    volumes:
+      - private-control-socket:/run/incomudon-pcl
+    restart: "no"
+
   relay:
     environment:
       INCOMUDON_MANAGEMENT_ENABLED: "false"
       INCOMUDON_PRIVATE_CONTROL_ENABLED: "true"
-      INCOMUDON_PRIVATE_CONTROL_LISTEN: "${INCOMUDON_PRIVATE_CONTROL_LISTEN:-:9443}"
-      INCOMUDON_PRIVATE_CONTROL_CERT_FILE: "/run/incomudon-private-control/server.crt"
-      INCOMUDON_PRIVATE_CONTROL_KEY_FILE: "/run/incomudon-private-control/server.key"
-      INCOMUDON_PRIVATE_CONTROL_CLIENT_CA_FILE: "/run/incomudon-private-control/client-ca.crt"
-      INCOMUDON_PRIVATE_CONTROL_SERVICES_CSV: "/run/incomudon-private-control/services.csv"
+      INCOMUDON_PRIVATE_CONTROL_TRANSPORT: "uds"
+      INCOMUDON_PRIVATE_CONTROL_UDS_SOCKET_PATH: "/run/incomudon-pcl/relay.sock"
+      INCOMUDON_PRIVATE_CONTROL_UDS_SOCKET_GROUP: "10003"
+      INCOMUDON_PRIVATE_CONTROL_UDS_SERVICES_CSV: "/run/incomudon-private-control/uds-services.csv"
       INCOMUDON_PRIVATE_CONTROL_RELAY_ID: "${INCOMUDON_PRIVATE_CONTROL_RELAY_ID:-relay-local}"
       INCOMUDON_PRIVATE_CONTROL_STATE_FILE: "/var/lib/incomudon-private-control/state.json"
+    group_add:
+      - "10003"
     volumes:
-      # The Relay can read, but cannot alter, Private Control Link credentials.
+      # The Relay can read its UDS peer-identity policy but cannot alter it.
       - "${INCOMUDON_PRIVATE_CONTROL_DATA_DIR:-./private-control}:/run/incomudon-private-control:ro"
+      # Only the Relay creates the socket; the Management container receives
+      # group write access to the socket but not to its parent directory.
+      - private-control-socket:/run/incomudon-pcl
       # Deny rules and completed command acknowledgements must survive restarts.
       - "${INCOMUDON_PRIVATE_CONTROL_STATE_DIR:-./private-control-state}:/var/lib/incomudon-private-control"
-    expose:
-      - "9443"
+    depends_on:
+      private-control-socket-init:
+        condition: service_completed_successfully
     networks:
       - default
       - management
@@ -24,24 +42,28 @@ services:
   management:
     image: "${INCOMUDON_MANAGEMENT_IMAGE:-ghcr.io/friedoudon/incomudon-management:main}"
     restart: unless-stopped
+    user: "10002:10002"
+    group_add:
+      - "10003"
     environment:
-      INCOMUDON_MANAGEMENT_PCL_RELAY_ADDRESS: "relay:9443"
-      INCOMUDON_MANAGEMENT_PCL_SERVER_NAME: "${INCOMUDON_MANAGEMENT_PCL_SERVER_NAME:-relay}"
+      INCOMUDON_MANAGEMENT_PCL_TRANSPORT: "uds"
+      INCOMUDON_MANAGEMENT_PCL_UDS_SOCKET_PATH: "/run/incomudon-pcl/relay.sock"
       INCOMUDON_MANAGEMENT_PCL_SERVICE_ID: "${INCOMUDON_MANAGEMENT_PCL_SERVICE_ID:-management-main}"
-      INCOMUDON_MANAGEMENT_PCL_CERT_FILE: "/run/incomudon-management-pcl/client.crt"
-      INCOMUDON_MANAGEMENT_PCL_KEY_FILE: "/run/incomudon-management-pcl/client.key"
-      INCOMUDON_MANAGEMENT_PCL_RELAY_CA_FILE: "/run/incomudon-management-pcl/relay-ca.crt"
       INCOMUDON_MANAGEMENT_HTTP_LISTEN: ":8080"
     volumes:
-      # Management client credentials are likewise read-only in the container.
-      - "${INCOMUDON_MANAGEMENT_PCL_DATA_DIR:-./management-pcl}:/run/incomudon-management-pcl:ro"
+      - private-control-socket:/run/incomudon-pcl
     expose:
       - "8080"
     depends_on:
+      private-control-socket-init:
+        condition: service_completed_successfully
       relay:
         condition: service_started
     networks:
       - management
+
+volumes:
+  private-control-socket:
 
 networks:
   management:
