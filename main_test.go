@@ -1119,6 +1119,10 @@ func TestFloorInterruptPreemptsDeterministicLowestPriority(t *testing.T) {
 	if _, exists := active[requesterID]; !exists {
 		t.Fatal("Floor Interrupt requester was not granted")
 	}
+	_, counters := s.relayDiagnosticsSnapshot()
+	if counters.PTTRequestsTotal != 1 || counters.GrantsTotal != 1 || counters.PreemptionsTotal != 1 || counters.DenialsTotal != 0 || counters.UnauthorizedRejectionsTotal != 0 {
+		t.Fatalf("Floor Interrupt preemption counters = %+v", counters)
+	}
 }
 
 func TestFloorInterruptDeniesTalkOnlyAdmission(t *testing.T) {
@@ -1161,6 +1165,57 @@ func TestFloorInterruptDeniesTalkOnlyAdmission(t *testing.T) {
 	}
 	if !s.isTalker(channelID, victimID) || s.isTalker(channelID, requesterID) {
 		t.Fatal("denied PTT_REQUEST changed active talk state")
+	}
+	_, counters := s.relayDiagnosticsSnapshot()
+	if counters.PTTRequestsTotal != 1 || counters.GrantsTotal != 0 || counters.DenialsTotal != 0 || counters.PreemptionsTotal != 0 || counters.UnauthorizedRejectionsTotal != 1 {
+		t.Fatalf("Floor Interrupt unauthorized counters = %+v", counters)
+	}
+}
+
+func TestFloorInterruptCountsAuthorizedNoPreemptionDeny(t *testing.T) {
+	relay := newTestUDPConn(t)
+	requesterAddr := newTestUDPConn(t)
+	victimAddr := newTestUDPConn(t)
+	const channelID uint32 = 88
+	const requesterID uint32 = 8000
+	const victimID uint32 = 8001
+	control, key := newRequiredControlAuthState(t, channelID)
+	identity, err := newIdentityAdmissionState(identityAdmissionRequired, "issuer", "audience", identitySigningKeyStore{"test": ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef")).Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	peerFor := func(addr *net.UDPAddr, senderID uint32, priority uint8) *peer {
+		return &peer{
+			addr:               addr,
+			senderId:           senderID,
+			authenticated:      true,
+			controlKeyID:       1,
+			identityAdmission:  &identityAdmission{permissions: identityPermissionListen | identityPermissionTalk | identityPermissionInterrupt, priority: priority, expiresAt: now.Add(time.Minute)},
+			membershipDeadline: now.Add(time.Minute),
+		}
+	}
+	s := newServer(relay, false, false, false, 0, false, 1)
+	s.configureControlAuth(control)
+	s.configureIdentityAdmission(identity, true)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(requesterAddr.LocalAddr().(*net.UDPAddr)): peerFor(requesterAddr.LocalAddr().(*net.UDPAddr), requesterID, 20),
+			peerMapKey(victimAddr.LocalAddr().(*net.UDPAddr)):    peerFor(victimAddr.LocalAddr().(*net.UDPAddr), victimID, 20),
+		},
+		activeTalkers: map[uint32]time.Time{victimID: now},
+		codecConfigs:  make(map[uint32][]byte),
+	}
+	if !s.handlePttRequest(channelID, requesterID, requesterAddr.LocalAddr().(*net.UDPAddr)) {
+		t.Fatal("authorized no-preemption request did not preserve membership eligibility")
+	}
+	deny := receiveTestPacket(t, requesterAddr)
+	if deny.Header.Type != pktTalkDeny || !verifyControlAuthPacket(deny, key) {
+		t.Fatal("authorized no-preemption request did not receive TALK_DENY")
+	}
+	_, counters := s.relayDiagnosticsSnapshot()
+	if counters.PTTRequestsTotal != 1 || counters.GrantsTotal != 0 || counters.DenialsTotal != 1 || counters.PreemptionsTotal != 0 || counters.UnauthorizedRejectionsTotal != 0 {
+		t.Fatalf("Floor Interrupt no-preemption counters = %+v", counters)
 	}
 }
 
@@ -1879,7 +1934,7 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	if err := decodePrivateControlJSON(rawAck, &ack); err != nil {
 		t.Fatalf("decode hello_ack: %v", err)
 	}
-	if ack.Type != "hello_ack" || ack.InReplyTo != helloID || ack.RelayID != "relay-test" || !ack.LifecycleEventsAccepted || !ack.AuditInputsAccepted || ack.DiagnosticsAccepted {
+	if ack.Type != "hello_ack" || ack.InReplyTo != helloID || ack.RelayID != "relay-test" || !ack.LifecycleEventsAccepted || !ack.AuditInputsAccepted || !ack.DiagnosticsAccepted {
 		t.Fatalf("unexpected hello_ack: %+v", ack)
 	}
 	rawHealth, err := readPrivateControlFrame(client)
@@ -1892,6 +1947,45 @@ func TestPrivateControlMTLSHelloExportsOnlyAcceptedCapabilities(t *testing.T) {
 	}
 	if health.Type != privateControlLifecycleEventType || health.EventType != "relay_health_changed" || health.ChannelID != nil || health.State == nil || *health.State != "healthy" {
 		t.Fatalf("unexpected initial health event: %+v", health)
+	}
+	diagnosticsID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatalf("diagnostics ID: %v", err)
+	}
+	if err := writePrivateControlFrame(client, privateControlGetRelayDiagnostics{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: diagnosticsID}); err != nil {
+		t.Fatalf("write diagnostics request: %v", err)
+	}
+	rawDiagnostics, err := readPrivateControlFrame(client)
+	if err != nil {
+		t.Fatalf("read diagnostics snapshot: %v", err)
+	}
+	var diagnostics privateControlRelayDiagnosticsSnapshot
+	if err := decodePrivateControlJSON(rawDiagnostics, &diagnostics); err != nil {
+		t.Fatalf("decode diagnostics snapshot: %v", err)
+	}
+	if diagnostics.Type != "relay_diagnostics_snapshot" || diagnostics.InReplyTo != diagnosticsID || diagnostics.RelayID != "relay-test" || !validPrivateControlID(diagnostics.CounterEpoch) || diagnostics.FloorInterrupt != (relayFloorInterruptCounters{}) {
+		t.Fatalf("unexpected diagnostics snapshot: %+v", diagnostics)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, diagnostics.ObservedAt); err != nil {
+		t.Fatalf("diagnostics observed_at: %v", err)
+	}
+	secondDiagnosticsID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatalf("second diagnostics ID: %v", err)
+	}
+	if err := writePrivateControlFrame(client, privateControlGetRelayDiagnostics{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: secondDiagnosticsID}); err != nil {
+		t.Fatalf("write rate-limited diagnostics request: %v", err)
+	}
+	rawRateLimited, err := readPrivateControlFrame(client)
+	if err != nil {
+		t.Fatalf("read rate-limited diagnostics error: %v", err)
+	}
+	var rateLimited privateControlError
+	if err := decodePrivateControlJSON(rawRateLimited, &rateLimited); err != nil {
+		t.Fatalf("decode rate-limited diagnostics error: %v", err)
+	}
+	if rateLimited.Type != "error" || rateLimited.InReplyTo != secondDiagnosticsID || rateLimited.Code != "overloaded" {
+		t.Fatalf("unexpected diagnostics rate limit: %+v", rateLimited)
 	}
 
 	grantIDHash := sha256.Sum256([]byte("private-control-test-grant"))

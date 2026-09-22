@@ -321,6 +321,86 @@ func TestPrivateControlFailureRateLimitExpires(t *testing.T) {
 	}
 }
 
+func TestPrivateControlDiagnosticsRequireNegotiation(t *testing.T) {
+	relay := newTestUDPConn(t)
+	link := newTestPrivateControlLink(t, newServer(relay, false, false, false, 0, false, 1))
+	requestID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(privateControlGetRelayDiagnostics{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: requestID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, closeConnection := link.handleRelayDiagnostics(&privateControlSession{serviceID: "management-main"}, raw, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: requestID})
+	if closeConnection {
+		t.Fatal("unnegotiated diagnostics request closed the session")
+	}
+	protocolError, ok := response.(privateControlError)
+	if !ok || protocolError.Code != privateControlUnsupportedMessage || protocolError.InReplyTo != requestID {
+		t.Fatalf("unnegotiated diagnostics response = %#v", response)
+	}
+
+	diagnosticSession := &privateControlSession{serviceID: "management-main", diagnostics: true}
+	response, closeConnection = link.handleRelayDiagnostics(diagnosticSession, raw, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: requestID})
+	if closeConnection {
+		t.Fatal("negotiated diagnostics request closed the session")
+	}
+	snapshot, ok := response.(privateControlRelayDiagnosticsSnapshot)
+	if !ok || snapshot.InReplyTo != requestID || !validPrivateControlID(snapshot.CounterEpoch) || snapshot.FloorInterrupt != (relayFloorInterruptCounters{}) {
+		t.Fatalf("negotiated diagnostics snapshot = %#v", response)
+	}
+	snapshotTime := diagnosticSession.lastDiagnostics
+	secondRequestID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRaw, err := json.Marshal(privateControlGetRelayDiagnostics{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: secondRequestID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, closeConnection = link.handleRelayDiagnostics(diagnosticSession, secondRaw, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: secondRequestID})
+	if closeConnection {
+		t.Fatal("rate-limited diagnostics request closed the session")
+	}
+	protocolError, ok = response.(privateControlError)
+	if !ok || protocolError.Code != "overloaded" || protocolError.InReplyTo != secondRequestID {
+		t.Fatalf("rate-limited diagnostics response = %#v", response)
+	}
+	if diagnosticSession.lastDiagnostics != snapshotTime {
+		t.Fatal("rate-limited diagnostics request restarted the rate-limit interval")
+	}
+	diagnosticSession.lastDiagnostics = time.Now().Add(-privateControlDiagnosticsMinInterval)
+	response, closeConnection = link.handleRelayDiagnostics(diagnosticSession, secondRaw, privateControlCommandEnvelope{SchemaVersion: privateControlSchemaVersion, Type: "get_relay_diagnostics", MessageID: secondRequestID})
+	if closeConnection {
+		t.Fatal("diagnostics request after the rate interval closed the session")
+	}
+	if _, ok := response.(privateControlRelayDiagnosticsSnapshot); !ok {
+		t.Fatalf("diagnostics response after the rate interval = %#v", response)
+	}
+}
+
+func TestRelayDiagnosticsCounterEpochResetsBeforeOverflow(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	s.floorInterrupt = true
+	oldEpoch, _ := s.relayDiagnosticsSnapshot()
+	s.diagnostics.mu.Lock()
+	s.diagnostics.floorInterrupt.PTTRequestsTotal = relayDiagnosticsCounterMaximum
+	s.diagnostics.mu.Unlock()
+	s.observeFloorInterruptDiagnostics(relayFloorInterruptCounterDelta{pttRequests: 1, grants: 1})
+	newEpoch, counters := s.relayDiagnosticsSnapshot()
+	if newEpoch == oldEpoch || !validPrivateControlID(newEpoch) || counters.PTTRequestsTotal != 1 || counters.GrantsTotal != 1 || counters.PreemptionsTotal != 0 {
+		t.Fatalf("counter overflow reset = epoch %q -> %q counters=%+v", oldEpoch, newEpoch, counters)
+	}
+
+	s.floorInterrupt = false
+	_, disabledCounters := s.relayDiagnosticsSnapshot()
+	if disabledCounters != (relayFloorInterruptCounters{}) {
+		t.Fatalf("Floor Interrupt disabled counters = %+v", disabledCounters)
+	}
+}
+
 func TestPrivateControlExportsFloorInterruptAuditInput(t *testing.T) {
 	relay := newTestUDPConn(t)
 	s := newServer(relay, false, false, false, 0, false, 1)

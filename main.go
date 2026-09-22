@@ -155,6 +155,7 @@ type server struct {
 	directory           *directoryV3
 	management          *managementPlane
 	privateControl      *privateControlLink
+	diagnostics         relayDiagnosticsState
 	floorInterrupt      bool
 	membershipLease     time.Duration
 	keepaliveInterval   time.Duration
@@ -186,6 +187,7 @@ func newServer(conn *net.UDPConn, noCrypto bool, logPackets bool, logAudio bool,
 		talkMax:           talkMax,
 		multiTalk:         multiTalk,
 		maxActiveTalkers:  maxActiveTalkers,
+		diagnostics:       newRelayDiagnosticsState(),
 		membershipLease:   defaultMembershipLease,
 		keepaliveInterval: defaultKeepaliveInterval,
 	}
@@ -1051,6 +1053,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	ch := s.channels[channelId]
 	if ch == nil || addr == nil {
 		s.mu.Unlock()
+		s.observeFloorInterruptDiagnostics(relayFloorInterruptCounterDelta{pttRequests: 1, unauthorizedRejections: 1})
 		s.denyPttRequest(channelId, senderId)
 		return false
 	}
@@ -1059,6 +1062,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 		!peerAllowsInterrupt(requester, now) {
 		requesterPriority := peerAdmissionPriority(requester, now)
 		s.mu.Unlock()
+		s.observeFloorInterruptDiagnostics(relayFloorInterruptCounterDelta{pttRequests: 1, unauthorizedRejections: 1})
 		s.denyPttRequest(channelId, senderId)
 		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "denied", nil, nil)
 		return false
@@ -1066,6 +1070,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	if _, active := ch.activeTalkers[senderId]; active {
 		requesterPriority := peerInterruptPriority(requester, now)
 		s.mu.Unlock()
+		s.observeFloorInterruptDiagnostics(relayFloorInterruptCounterDelta{pttRequests: 1, grants: 1})
 		s.sendRelayControlTo(channelId, senderId, pktTalkGrant, senderId, talkPayload(senderId))
 		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "success", nil, nil)
 		return true
@@ -1082,6 +1087,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 		requesterPriority := peerInterruptPriority(requester, now)
 		ch.activeTalkers[senderId] = now
 		s.mu.Unlock()
+		s.observeFloorInterruptDiagnostics(relayFloorInterruptCounterDelta{pttRequests: 1, grants: 1})
 		s.broadcastRelayControl(channelId, pktTalkGrant, senderId, talkPayload(senderId))
 		s.publishManagementEvent("talk_started", uint32Pointer(channelId), uint32Pointer(senderId), nil, nil, nil, nil)
 		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "success", nil, nil)
@@ -1101,6 +1107,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	if victim == 0 || requesterPriority <= victimPriority {
 		current := firstActiveTalker(ch)
 		s.mu.Unlock()
+		s.observeFloorInterruptDiagnostics(relayFloorInterruptCounterDelta{pttRequests: 1, denials: 1})
 		s.sendRelayControlTo(channelId, senderId, pktTalkDeny, current, talkPayload(current))
 		s.publishFloorInterruptAudit(requester, channelId, requesterPriority, "denied", nil, nil)
 		return true
@@ -1108,6 +1115,7 @@ func (s *server) handlePttRequest(channelId uint32, senderId uint32, addr *net.U
 	delete(ch.activeTalkers, victim)
 	ch.activeTalkers[senderId] = now
 	s.mu.Unlock()
+	s.observeFloorInterruptDiagnostics(relayFloorInterruptCounterDelta{pttRequests: 1, grants: 1, preemptions: 1})
 
 	// Release is sent first to minimize the time a replacement overlaps queued
 	// old media. Receivers still must tolerate UDP reordering.

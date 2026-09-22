@@ -330,10 +330,13 @@ A Management Service starts a `private-control-link-v1` session with `hello`.
 The Relay independently accepts requested lifecycle-event, audit-input, and
 diagnostics capabilities, then uses bounded, best-effort queues for redacted
 outbound notifications. Diagnostics negotiation is mandatory in the `hello`
-wire shape; this Relay currently returns `diagnostics_accepted: false`. It
-neither retains nor replays those notifications, and never assigns external SSE
-cursor IDs. A full queue drops the affected notification rather than delaying
-media forwarding; the Management Service owns any durable SSE or audit storage.
+wire shape. When requested, this Relay accepts `get_relay_diagnostics` and
+returns a process-local, redacted Floor Interrupt counter snapshot; diagnostic
+reads are limited to one accepted request per session every ten seconds. It
+neither retains nor replays notifications or diagnostic snapshots, and never
+assigns external SSE cursor IDs. A full queue drops the affected notification
+rather than delaying media forwarding; the Management Service owns any durable
+SSE, audit, or metric storage.
 
 The Relay exports `participant_joined`, `participant_left`, `talk_started`,
 `talk_ended`, `service_admission_issued`, `service_admission_revoked`, and an

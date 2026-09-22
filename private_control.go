@@ -23,25 +23,26 @@ import (
 )
 
 const (
-	privateControlSchemaVersion             = "private-control-link-v1"
-	privateControlMaxFrameBytes             = 65536
-	privateControlMaxJSONInteger      int64 = 9007199254740991
-	privateControlSessionQueueDepth         = 256
-	privateControlHelloDeadline             = 5 * time.Second
-	privateControlTLSMinVersion             = tls.VersionTLS13
-	privateControlLifecycleEventType        = "relay_lifecycle_event"
-	privateControlAuditInputType            = "relay_audit_input"
-	privateControlUnsupportedMessage        = "unsupported_message"
-	privateControlIdentityMismatch          = "identity_mismatch"
-	privateControlMalformedConnection       = "malformed private control frame"
-	privateControlIdempotencyTTL            = 10 * time.Minute
-	privateControlMaxDenyPeriod             = 90 * time.Minute
-	privateControlMaxIdempotency            = 1024
-	privateControlMaxCommands               = 32
-	privateControlMaxConnections            = 64
-	privateControlFailureWindow             = time.Minute
-	privateControlMaxFailures               = 8
-	privateControlMaxFailureSources         = 1024
+	privateControlSchemaVersion                = "private-control-link-v1"
+	privateControlMaxFrameBytes                = 65536
+	privateControlMaxJSONInteger         int64 = 9007199254740991
+	privateControlSessionQueueDepth            = 256
+	privateControlHelloDeadline                = 5 * time.Second
+	privateControlTLSMinVersion                = tls.VersionTLS13
+	privateControlLifecycleEventType           = "relay_lifecycle_event"
+	privateControlAuditInputType               = "relay_audit_input"
+	privateControlUnsupportedMessage           = "unsupported_message"
+	privateControlIdentityMismatch             = "identity_mismatch"
+	privateControlMalformedConnection          = "malformed private control frame"
+	privateControlIdempotencyTTL               = 10 * time.Minute
+	privateControlMaxDenyPeriod                = 90 * time.Minute
+	privateControlDiagnosticsMinInterval       = 10 * time.Second
+	privateControlMaxIdempotency               = 1024
+	privateControlMaxCommands                  = 32
+	privateControlMaxConnections               = 64
+	privateControlFailureWindow                = time.Minute
+	privateControlMaxFailures                  = 8
+	privateControlMaxFailureSources            = 1024
 )
 
 type privateControlConfig struct {
@@ -77,6 +78,8 @@ type privateControlSession struct {
 	serviceID       string
 	lifecycleEvents bool
 	auditInputs     bool
+	diagnostics     bool
+	lastDiagnostics time.Time
 	send            chan any
 	done            chan struct{}
 	closeOnce       sync.Once
@@ -162,6 +165,23 @@ type privateControlPong struct {
 	Type          string `json:"type"`
 	MessageID     string `json:"message_id"`
 	InReplyTo     string `json:"in_reply_to"`
+}
+
+type privateControlGetRelayDiagnostics struct {
+	SchemaVersion string `json:"schema_version"`
+	Type          string `json:"type"`
+	MessageID     string `json:"message_id"`
+}
+
+type privateControlRelayDiagnosticsSnapshot struct {
+	SchemaVersion  string                      `json:"schema_version"`
+	Type           string                      `json:"type"`
+	MessageID      string                      `json:"message_id"`
+	InReplyTo      string                      `json:"in_reply_to"`
+	RelayID        string                      `json:"relay_id"`
+	CounterEpoch   string                      `json:"counter_epoch"`
+	ObservedAt     string                      `json:"observed_at"`
+	FloorInterrupt relayFloorInterruptCounters `json:"floor_interrupt"`
 }
 
 type privateControlError struct {
@@ -801,6 +821,10 @@ func validPrivateControlPing(message privateControlPing) bool {
 	return message.SchemaVersion == privateControlSchemaVersion && message.Type == "ping" && validPrivateControlID(message.MessageID)
 }
 
+func validPrivateControlGetRelayDiagnostics(message privateControlGetRelayDiagnostics) bool {
+	return message.SchemaVersion == privateControlSchemaVersion && message.Type == "get_relay_diagnostics" && validPrivateControlID(message.MessageID)
+}
+
 func decodePrivateControlSelector(raw []byte) (privateControlCommandEnvelope, error) {
 	var selector privateControlCommandEnvelope
 	if err := json.Unmarshal(raw, &selector); err != nil {
@@ -903,6 +927,43 @@ func (l *privateControlLink) handleRevocation(session *privateControlSession, ra
 	return ack, false
 }
 
+func (l *privateControlLink) handleRelayDiagnostics(session *privateControlSession, raw []byte, selector privateControlCommandEnvelope) (any, bool) {
+	var request privateControlGetRelayDiagnostics
+	if err := decodePrivateControlJSON(raw, &request); err != nil || !validPrivateControlGetRelayDiagnostics(request) {
+		return nil, true
+	}
+	if !session.diagnostics {
+		response, err := newPrivateControlError(selector.MessageID, privateControlUnsupportedMessage)
+		return response, err != nil
+	}
+	now := time.Now()
+	if !session.lastDiagnostics.IsZero() && now.Sub(session.lastDiagnostics) < privateControlDiagnosticsMinInterval {
+		response, err := newPrivateControlError(selector.MessageID, "overloaded")
+		return response, err != nil
+	}
+	if l.server == nil {
+		response, err := newPrivateControlError(selector.MessageID, "internal_error")
+		return response, err != nil
+	}
+	messageID, err := newPrivateControlID()
+	if err != nil {
+		response, responseErr := newPrivateControlError(selector.MessageID, "internal_error")
+		return response, responseErr != nil
+	}
+	counterEpoch, counters := l.server.relayDiagnosticsSnapshot()
+	session.lastDiagnostics = now
+	return privateControlRelayDiagnosticsSnapshot{
+		SchemaVersion:  privateControlSchemaVersion,
+		Type:           "relay_diagnostics_snapshot",
+		MessageID:      messageID,
+		InReplyTo:      request.MessageID,
+		RelayID:        l.relayID,
+		CounterEpoch:   counterEpoch,
+		ObservedAt:     now.UTC().Format(time.RFC3339Nano),
+		FloorInterrupt: counters,
+	}, false
+}
+
 func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 	defer rawConnection.Close()
 	connection, ok := rawConnection.(*tls.Conn)
@@ -950,6 +1011,7 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 		serviceID:       serviceID,
 		lifecycleEvents: *hello.WantLifecycleEvents,
 		auditInputs:     *hello.WantAuditInputs,
+		diagnostics:     *hello.WantDiagnostics,
 		send:            make(chan any, privateControlSessionQueueDepth),
 		done:            make(chan struct{}),
 	}
@@ -974,9 +1036,7 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 		RelayID:                 l.relayID,
 		LifecycleEventsAccepted: *hello.WantLifecycleEvents,
 		AuditInputsAccepted:     *hello.WantAuditInputs,
-		// Relay diagnostics are negotiated explicitly but are not exported by
-		// this implementation yet.
-		DiagnosticsAccepted: false,
+		DiagnosticsAccepted:     *hello.WantDiagnostics,
 	}) {
 		return
 	}
@@ -1018,6 +1078,14 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 			}
 		case "revoke_service_admission":
 			response, closeConnection := l.handleRevocation(session, rawMessage, selector)
+			if closeConnection || response == nil || !session.enqueue(response) {
+				if closeConnection {
+					l.recordConnectionFailure(source, "command")
+				}
+				return
+			}
+		case "get_relay_diagnostics":
+			response, closeConnection := l.handleRelayDiagnostics(session, rawMessage, selector)
 			if closeConnection || response == nil || !session.enqueue(response) {
 				if closeConnection {
 					l.recordConnectionFailure(source, "command")
