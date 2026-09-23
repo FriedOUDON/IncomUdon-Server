@@ -28,6 +28,7 @@ const (
 	packetFlagControlAuthV1     uint16 = 1 << 1
 	maxUDPDatagramBytes                = 1200
 	maxActiveTalkersV1                 = 16
+	maxTalkMaximumSecondsV1            = 0xFFFF
 	udpNearLimitBytes                  = 1150
 	defaultMembershipLease             = 30 * time.Second
 	defaultKeepaliveInterval           = 10 * time.Second
@@ -1320,10 +1321,14 @@ func durationToSecondsClamped(d time.Duration) uint16 {
 	if sec <= 0 {
 		sec = 1
 	}
-	if sec > 0xFFFF {
-		sec = 0xFFFF
+	if sec > maxTalkMaximumSecondsV1 {
+		sec = maxTalkMaximumSecondsV1
 	}
 	return uint16(sec)
+}
+
+func validMaximumTalkSeconds(seconds int) bool {
+	return seconds >= 0 && seconds <= maxTalkMaximumSecondsV1
 }
 
 func (s *server) sendServerConfig(channelId uint32, senderId uint32) {
@@ -1859,7 +1864,7 @@ func main() {
 			log.Printf("invalid INCOMUDON_TALK_MAX_SEC=%q (using 0)", raw)
 		}
 	}
-	talkMaxSec := flag.Int("talk-max-sec", talkMaxSecDefault, "max TX hold time in seconds (0 disables timeout)")
+	talkMaxSec := flag.Int("talk-max-sec", talkMaxSecDefault, "max TX hold time in seconds (0..65535; 0 disables timeout)")
 	multiTalkDefault := false
 	if raw := os.Getenv("INCOMUDON_MULTI_TALK"); raw != "" {
 		if parsed, err := strconv.ParseBool(raw); err == nil {
@@ -1990,8 +1995,8 @@ func main() {
 	logAudio := flag.Bool("log-audio", false, "log audio packets too (requires -log-packets)")
 	flag.Parse()
 
-	if *talkMaxSec < 0 {
-		*talkMaxSec = 0
+	if !validMaximumTalkSeconds(*talkMaxSec) {
+		log.Fatalf("invalid talk max: must be 0..%d seconds (got %d)", maxTalkMaximumSecondsV1, *talkMaxSec)
 	}
 	if *maxActiveTalkers < 1 {
 		*maxActiveTalkers = 1

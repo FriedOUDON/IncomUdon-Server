@@ -200,6 +200,19 @@ func TestCodecConfigUsesU32BitrateAndRequiredAESGCMV2Policy(t *testing.T) {
 	}
 }
 
+func TestMaximumTalkSecondsV1Range(t *testing.T) {
+	for _, seconds := range []int{0, 1, maxTalkMaximumSecondsV1} {
+		if !validMaximumTalkSeconds(seconds) {
+			t.Fatalf("valid talk maximum %d was rejected", seconds)
+		}
+	}
+	for _, seconds := range []int{-1, maxTalkMaximumSecondsV1 + 1} {
+		if validMaximumTalkSeconds(seconds) {
+			t.Fatalf("invalid talk maximum %d was accepted", seconds)
+		}
+	}
+}
+
 func TestOptionalConfiguredControlAuthAllowsAuthenticatedCompatibilityMedia(t *testing.T) {
 	relay := newTestUDPConn(t)
 	sender := newTestUDPConn(t)

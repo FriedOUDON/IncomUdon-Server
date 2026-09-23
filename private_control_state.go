@@ -143,7 +143,13 @@ func writePrivateControlPersistentState(path string, state privateControlPersist
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, path)
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	if err := syncPrivateControlStateDirectory(directory); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (l *privateControlLink) persistentStateSnapshot(now time.Time) (privateControlPersistentState, error) {

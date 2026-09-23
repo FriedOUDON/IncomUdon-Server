@@ -40,7 +40,7 @@ INCOMUDON_TALK_MAX_SEC=60 go run . -port 50000
 ```
 
 Notes:
-- `0` disables timeout.
+- `0` disables timeout; non-zero values must be in the `1..65535` range.
 - If both are set, `-talk-max-sec` takes precedence.
 - On channel join, server sends this value to clients via `pktServerCfg` so clients can show remaining TX time.
 - `TALK_RELEASE` carries the Version 1 release reason, including client PTT off,
@@ -362,6 +362,17 @@ When Managed Service Admission is enabled, `INCOMUDON_PRIVATE_CONTROL_STATE_FILE
 is required. Its parent directory must be writable only by the Relay and must
 not be the read-only credential directory. An event-export-only PCL deployment
 without Managed Service Admission does not require a state file.
+
+On Unix, the default `required` secret-file policy also requires the state
+directory to be Relay-owned and mode `0700`, and an existing state file to be
+Relay-owned, regular, and mode `0600`. The Relay synchronizes the state file
+and its directory before acknowledging a revocation.
+
+Stateful Service Admission revocation therefore requires a non-Windows
+deployment and a filesystem that supports directory synchronization. On
+Windows, the Relay cannot provide portable directory synchronization and
+refuses to start PCL when Managed Service Admission is enabled. Event-export-
+only PCL remains available without a state file.
 
 Set `INCOMUDON_PRIVATE_CONTROL_TRANSPORT` to exactly one profile. The Relay
 does not fall back between profiles.

@@ -1215,6 +1215,11 @@ func startPrivateControlLink(server *server, config privateControlConfig) (*priv
 	if revocationEnabled && strings.TrimSpace(config.stateFile) == "" {
 		return nil, errors.New("private control state file is required when managed service admission is enabled")
 	}
+	if revocationEnabled {
+		if err := validatePrivateControlStateDurability(); err != nil {
+			return nil, err
+		}
+	}
 	var (
 		policy privateControlPolicy
 		err    error
@@ -1237,6 +1242,11 @@ func startPrivateControlLink(server *server, config privateControlConfig) (*priv
 	}
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(config.stateFile) != "" {
+		if err := validatePrivateControlStatePath(config.stateFile, config.secretPermissions); err != nil {
+			return nil, err
+		}
 	}
 	link, err := newPrivateControlLink(server, policy, config.relayID, config.stateFile)
 	if err != nil {
