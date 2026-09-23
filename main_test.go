@@ -21,9 +21,56 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+// sseTestResponseRecorder permits a streaming handler and the test to inspect
+// the response concurrently without racing on httptest.ResponseRecorder.
+type sseTestResponseRecorder struct {
+	mu        sync.Mutex
+	recorder  *httptest.ResponseRecorder
+	flushed   chan struct{}
+	flushOnce sync.Once
+}
+
+func newSSETestResponseRecorder() *sseTestResponseRecorder {
+	return &sseTestResponseRecorder{
+		recorder: httptest.NewRecorder(),
+		flushed:  make(chan struct{}),
+	}
+}
+
+func (r *sseTestResponseRecorder) Header() http.Header {
+	return r.recorder.Header()
+}
+
+func (r *sseTestResponseRecorder) WriteHeader(statusCode int) {
+	r.mu.Lock()
+	r.recorder.WriteHeader(statusCode)
+	r.mu.Unlock()
+}
+
+func (r *sseTestResponseRecorder) Write(data []byte) (int, error) {
+	r.mu.Lock()
+	n, err := r.recorder.Write(data)
+	r.mu.Unlock()
+	return n, err
+}
+
+func (r *sseTestResponseRecorder) Flush() {
+	r.mu.Lock()
+	r.recorder.Flush()
+	r.mu.Unlock()
+	r.flushOnce.Do(func() { close(r.flushed) })
+}
+
+func (r *sseTestResponseRecorder) statusCode() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.recorder.Code
+}
 
 func newTestUDPConn(t *testing.T) *net.UDPConn {
 	t.Helper()
@@ -292,6 +339,27 @@ func TestOptionalConfiguredControlAuthAllowsAuthenticatedCompatibilityMedia(t *t
 	s.handlePacket(legacy, sender.LocalAddr().(*net.UDPAddr))
 	if forwarded := receiveTestPacket(t, listener); !bytes.Equal(forwarded.Raw, legacyRaw) {
 		t.Fatal("authenticated optional channel did not forward legacy-xor media")
+	}
+	legacyUnknownFlagRaw := append([]byte(nil), legacyRaw...)
+	binary.BigEndian.PutUint16(legacyUnknownFlagRaw[14:16], 0x8000)
+	legacyUnknownFlagPacket, ok := parsePacket(legacyUnknownFlagRaw, true)
+	if !ok {
+		t.Fatal("parse legacy-xor media with unknown flag")
+	}
+	s.handlePacket(legacyUnknownFlagPacket, sender.LocalAddr().(*net.UDPAddr))
+	if forwarded := receiveTestPacket(t, listener); !bytes.Equal(forwarded.Raw, legacyUnknownFlagRaw) {
+		t.Fatal("legacy-xor media with an unknown flag was not forwarded")
+	}
+
+	unknownFlagRaw := buildRelayControlPacket(pktAudio, channelID, senderID, []byte{0, 3, 0x44}, true, 5)
+	binary.BigEndian.PutUint16(unknownFlagRaw[14:16], 0x8000)
+	unknownFlagPacket, ok := parsePacket(unknownFlagRaw, true)
+	if !ok {
+		t.Fatal("parse compatibility media with unknown flag")
+	}
+	s.handlePacket(unknownFlagPacket, sender.LocalAddr().(*net.UDPAddr))
+	if forwarded := receiveTestPacket(t, listener); !bytes.Equal(forwarded.Raw, unknownFlagRaw) {
+		t.Fatal("compatibility media with an unknown flag was not forwarded")
 	}
 }
 
@@ -1707,7 +1775,7 @@ func TestEmbeddedManagementPlaneLiveEventsIgnoreLastEventID(t *testing.T) {
 	plane, service, _ := newTestManagementPlane(t, s, "viewer")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	response := httptest.NewRecorder()
+	response := newSSETestResponseRecorder()
 	done := make(chan struct{})
 	request := httptest.NewRequest(http.MethodGet, "/v1/events", nil).WithContext(ctx)
 	request.Header.Set("Last-Event-ID", "not-a-replay-cursor")
@@ -1729,8 +1797,13 @@ func TestEmbeddedManagementPlaneLiveEventsIgnoreLastEventID(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if response.Code != http.StatusOK {
-		t.Fatalf("live Last-Event-ID status = %d", response.Code)
+	select {
+	case <-response.flushed:
+	case <-time.After(time.Second):
+		t.Fatal("live event response was not flushed")
+	}
+	if response.statusCode() != http.StatusOK {
+		t.Fatalf("live Last-Event-ID status = %d", response.statusCode())
 	}
 	cancel()
 	select {

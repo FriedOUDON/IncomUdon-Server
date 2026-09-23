@@ -640,7 +640,9 @@ func (s *server) mediaMatchesCodecConfig(pkt parsedPacket) bool {
 }
 
 func (s *server) isCompatibilityMediaPacket(pkt parsedPacket) bool {
-	if pkt.Header.Flags != 0 {
+	// Reserved flag bits are ignored on receipt. Compatibility media only
+	// rejects security modes that conflict with its own framing.
+	if pkt.Header.Flags&(packetFlagAESGCMV2HeaderAAD|packetFlagControlAuthV1) != 0 {
 		return false
 	}
 	switch pkt.Header.HeaderLen {
