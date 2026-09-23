@@ -637,10 +637,17 @@ func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []b
 		if !authenticated || controlKeyID == 0 || !s.controlAuthRequired(channelId) {
 			return codecConfigState{}, false
 		}
-	} else if s.controlAuthRequired(channelId) {
-		// The required policy is the AES-GCM-v2-only profile. A zero base is
-		// the no-crypto/legacy-xor compatibility form and is not selectable.
-		return codecConfigState{}, false
+	} else {
+		if s.requiresAESGCMV2MediaProfile() {
+			// Only the global required policy is the AES-GCM-v2-only profile.
+			return codecConfigState{}, false
+		}
+		if s.controlAuthRequired(channelId) && (!authenticated || controlKeyID == 0) {
+			// An optional channel with a configured Control Key may use a
+			// compatibility media mode, but its control packet is still required
+			// to be authenticated.
+			return codecConfigState{}, false
+		}
 	}
 
 	state := codecConfigState{
@@ -663,11 +670,9 @@ func (s *server) cacheCodecConfig(channelId uint32, senderId uint32, payload []b
 	if ch.mediaCodecConfigs == nil {
 		ch.mediaCodecConfigs = make(map[uint32]codecConfigState)
 	}
-	if hasAESGCMV2Base {
-		ch.mediaCodecConfigs[senderId] = state
-	} else {
-		delete(ch.mediaCodecConfigs, senderId)
-	}
+	// Authenticated optional channels also require a verified zero-base
+	// configuration before forwarding no-crypto or legacy-xor media.
+	ch.mediaCodecConfigs[senderId] = state
 	return state, true
 }
 

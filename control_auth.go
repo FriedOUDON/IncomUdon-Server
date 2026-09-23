@@ -469,6 +469,13 @@ func (s *server) controlAuthRequired(channelID uint32) bool {
 	return s.controlAuth != nil && s.controlAuth.requires(channelID)
 }
 
+// requiresAESGCMV2MediaProfile is narrower than controlAuthRequired: an
+// optional channel with a configured Control Key authenticates control traffic
+// but still permits the no-crypto and legacy-xor compatibility media modes.
+func (s *server) requiresAESGCMV2MediaProfile() bool {
+	return s.controlAuth != nil && s.controlAuth.policy == controlAuthRequired
+}
+
 func (s *server) verifyIncomingControl(pkt parsedPacket) (controlAuthMeta, bool) {
 	if s.controlAuth == nil {
 		return controlAuthMeta{}, false
@@ -609,19 +616,44 @@ func (s *server) isAuthenticatedPeer(channelID uint32, senderID uint32, addr *ne
 }
 
 func (s *server) mediaMatchesCodecConfig(pkt parsedPacket) bool {
-	if pkt.Header.HeaderLen != aesGCMV2HeaderSize ||
-		pkt.Header.Flags&packetFlagAESGCMV2HeaderAAD == 0 ||
-		pkt.Sec.KeyID != 2 {
-		return false
-	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	ch := s.channels[pkt.Header.ChannelId]
 	if ch == nil {
+		s.mu.Unlock()
 		return false
 	}
 	config, found := ch.mediaCodecConfigs[pkt.Header.SenderId]
-	return found && config.mediaKeyID == pkt.Sec.KeyID && config.mediaNonceBase == pkt.Sec.MediaNonceBase
+	s.mu.Unlock()
+	if !found {
+		return false
+	}
+
+	var zeroBase [12]byte
+	if config.mediaNonceBase == zeroBase {
+		return s.isCompatibilityMediaPacket(pkt)
+	}
+	return pkt.Header.HeaderLen == aesGCMV2HeaderSize &&
+		pkt.Header.Flags&packetFlagAESGCMV2HeaderAAD != 0 &&
+		pkt.Sec.KeyID == 2 &&
+		config.mediaKeyID == pkt.Sec.KeyID &&
+		config.mediaNonceBase == pkt.Sec.MediaNonceBase
+}
+
+func (s *server) isCompatibilityMediaPacket(pkt parsedPacket) bool {
+	if pkt.Header.Flags != 0 {
+		return false
+	}
+	switch pkt.Header.HeaderLen {
+	case fixedHeaderSize:
+		return s.noCrypto && len(pkt.Tag) == 0
+	case fixedHeaderSize + securityHeaderExtensionSize:
+		// legacy-xor uses media key ID 1. The Relay forwards its opaque
+		// ciphertext and tag after binding the sender to an authenticated
+		// compatibility CODEC_CONFIG.
+		return pkt.Sec.KeyID == 1 && len(pkt.Tag) == authTagSize
+	default:
+		return false
+	}
 }
 
 func (s *server) sendAuthenticatedChallenge(addr *net.UDPAddr, channelID uint32, senderID uint32, keyID uint32, payload []byte) {

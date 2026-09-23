@@ -200,6 +200,88 @@ func TestCodecConfigUsesU32BitrateAndRequiredAESGCMV2Policy(t *testing.T) {
 	}
 }
 
+func TestOptionalConfiguredControlAuthAllowsAuthenticatedCompatibilityMedia(t *testing.T) {
+	relay := newTestUDPConn(t)
+	sender := newTestUDPConn(t)
+	listener := newTestUDPConn(t)
+	const channelID uint32 = 481
+	const senderID uint32 = 8101
+	const listenerID uint32 = 8102
+	const sessionID uint32 = 0x33445566
+	key := []byte("0123456789abcdef0123456789abcdef")
+	state, err := newControlAuthState(
+		controlAuthOptional,
+		controlKeyStore{channelID: {1: key}},
+		[]byte("abcdefghijklmnopqrstuvwxyz012345"),
+	)
+	if err != nil {
+		t.Fatalf("new optional control auth state: %v", err)
+	}
+
+	s := newServer(relay, true, false, false, 0, true, 2)
+	s.configureControlAuth(state)
+	s.channels[channelID] = &channel{
+		peers: map[string]*peer{
+			peerMapKey(sender.LocalAddr().(*net.UDPAddr)): {
+				addr: sender.LocalAddr().(*net.UDPAddr), senderId: senderID, authenticated: true,
+				controlSessionID: sessionID, controlKeyID: 1, controlHighest: 1, controlSeenWindow: 1,
+				membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute),
+			},
+			peerMapKey(listener.LocalAddr().(*net.UDPAddr)): {
+				addr: listener.LocalAddr().(*net.UDPAddr), senderId: listenerID, authenticated: true,
+				controlSessionID: 0x778899aa, controlKeyID: 1, controlHighest: 1, controlSeenWindow: 1,
+				membershipLease: 30 * time.Second, membershipDeadline: time.Now().Add(time.Minute),
+			},
+		},
+		activeTalkers:     map[uint32]time.Time{senderID: time.Now()},
+		codecConfigs:      make(map[uint32][]byte),
+		mediaCodecConfigs: make(map[uint32]codecConfigState),
+	}
+
+	compatibilityConfig := append([]byte{0, 2, 0, 0, 0x3e, 0x80, 0}, make([]byte, 12)...)
+	if _, ok := s.cacheCodecConfig(channelID, senderID, compatibilityConfig, 0, false); ok {
+		t.Fatal("optional configured channel accepted unauthenticated compatibility CODEC_CONFIG")
+	}
+	configRaw := buildAuthenticatedControlPacket(pktCodecConfig, channelID, senderID, compatibilityConfig, 1, key, uint64(sessionID)<<32|2)
+	config, ok := parsePacket(configRaw, true)
+	if !ok {
+		t.Fatal("parse authenticated compatibility CODEC_CONFIG")
+	}
+	s.handlePacket(config, sender.LocalAddr().(*net.UDPAddr))
+
+	forwardedConfig := receiveTestPacket(t, listener)
+	if forwardedConfig.Header.Type != pktCodecConfig || !verifyControlAuthPacket(forwardedConfig, key) {
+		t.Fatal("compatibility CODEC_CONFIG was not Relay-reauthenticated")
+	}
+	if !bytes.Equal(forwardedConfig.Payload, compatibilityConfig) {
+		t.Fatalf("forwarded compatibility CODEC_CONFIG payload = %x, want %x", forwardedConfig.Payload, compatibilityConfig)
+	}
+
+	noCryptoRaw := buildRelayControlPacket(pktAudio, channelID, senderID, []byte{0, 1, 0x42}, true, 3)
+	noCrypto, ok := parsePacket(noCryptoRaw, true)
+	if !ok {
+		t.Fatal("parse no-crypto media")
+	}
+	if !s.mediaMatchesCodecConfig(noCrypto) {
+		t.Fatal("authenticated optional channel rejected no-crypto media after compatibility CODEC_CONFIG")
+	}
+	s.handlePacket(noCrypto, sender.LocalAddr().(*net.UDPAddr))
+	if forwarded := receiveTestPacket(t, listener); !bytes.Equal(forwarded.Raw, noCryptoRaw) {
+		t.Fatal("authenticated optional channel did not forward no-crypto media")
+	}
+
+	legacyRaw := buildRelayControlPacket(pktAudio, channelID, senderID, []byte{0, 2, 0x43}, false, 4)
+	binary.BigEndian.PutUint32(legacyRaw[24:28], 1)
+	legacy, ok := parsePacket(legacyRaw, true)
+	if !ok {
+		t.Fatal("parse legacy-xor media")
+	}
+	s.handlePacket(legacy, sender.LocalAddr().(*net.UDPAddr))
+	if forwarded := receiveTestPacket(t, listener); !bytes.Equal(forwarded.Raw, legacyRaw) {
+		t.Fatal("authenticated optional channel did not forward legacy-xor media")
+	}
+}
+
 func TestUDPDatagramSizeLimit(t *testing.T) {
 	if !acceptsUDPDatagramSize(maxUDPDatagramBytes) {
 		t.Fatalf("%d-byte datagram should be accepted", maxUDPDatagramBytes)
