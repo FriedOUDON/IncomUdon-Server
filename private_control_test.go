@@ -255,6 +255,70 @@ func TestManagedServiceIDGrammarIsSharedByPCL(t *testing.T) {
 	}
 }
 
+func TestPrivateControlStateSnapshotCapturesOrderedRelayState(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	s.channels[200] = &channel{
+		peers: map[string]*peer{
+			"two": {senderId: 2},
+			"one": {senderId: 1},
+		},
+		activeTalkers:     map[uint32]time.Time{2: time.Now()},
+		codecConfigs:      make(map[uint32][]byte),
+		mediaCodecConfigs: make(map[uint32]codecConfigState),
+	}
+	s.channels[100] = &channel{
+		peers:             map[string]*peer{},
+		activeTalkers:     make(map[uint32]time.Time),
+		codecConfigs:      make(map[uint32][]byte),
+		mediaCodecConfigs: make(map[uint32]codecConfigState),
+	}
+
+	chunks, err := s.privateControlSnapshotChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 || len(chunks[0]) != 2 {
+		t.Fatalf("unexpected snapshot chunks: %#v", chunks)
+	}
+	if chunks[0][0].ChannelID != 100 || len(chunks[0][0].Participants) != 0 {
+		t.Fatalf("empty channel snapshot = %#v", chunks[0][0])
+	}
+	participants := chunks[0][1].Participants
+	if chunks[0][1].ChannelID != 200 || len(participants) != 2 || participants[0].SenderID != 1 || participants[0].State != "idle" || participants[1].SenderID != 2 || participants[1].State != "talking" {
+		t.Fatalf("participant snapshot = %#v", chunks[0][1])
+	}
+}
+
+func TestPrivateControlStateSnapshotChunksLargeChannels(t *testing.T) {
+	participants := make([]privateControlSnapshotParticipant, 0, 5000)
+	for senderID := uint32(1); senderID <= 5000; senderID++ {
+		participants = append(participants, privateControlSnapshotParticipant{SenderID: senderID, State: "idle"})
+	}
+	chunks, err := privateControlChunkSnapshotEntries([]privateControlSnapshotChannel{{ChannelID: 100, Participants: participants}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 2 || len(chunks) > privateControlSnapshotMaxChunks {
+		t.Fatalf("snapshot chunk count = %d", len(chunks))
+	}
+	seen := 0
+	for _, chunk := range chunks {
+		if !privateControlSnapshotChannelsFit(chunk) {
+			t.Fatal("snapshot chunk exceeded the bounded frame size")
+		}
+		for _, channel := range chunk {
+			if channel.ChannelID != 100 {
+				t.Fatalf("snapshot channel = %d", channel.ChannelID)
+			}
+			seen += len(channel.Participants)
+		}
+	}
+	if seen != len(participants) {
+		t.Fatalf("snapshot participant count = %d, want %d", seen, len(participants))
+	}
+}
+
 func TestPrivateControlUDSPolicyRequiresCanonicalUniqueNonRootUIDs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "private-control-uds-services.csv")
 	if err := os.WriteFile(path, []byte("management_service_id,uid,enabled\nmanagement-main,10002,true\nmanagement-disabled,10003,false\n"), 0o600); err != nil {

@@ -76,6 +76,7 @@ type privateControlLink struct {
 	policy       privateControlPolicy
 	authenticate privateControlConnectionAuthenticator
 	mu           sync.Mutex
+	eventMu      sync.Mutex
 	sessions     map[string]*privateControlSession
 	dropped      uint64
 	failures     map[string]privateControlFailureState
@@ -182,6 +183,33 @@ type privateControlGetRelayDiagnostics struct {
 	SchemaVersion string `json:"schema_version"`
 	Type          string `json:"type"`
 	MessageID     string `json:"message_id"`
+}
+
+type privateControlGetRelayStateSnapshot struct {
+	SchemaVersion string `json:"schema_version"`
+	Type          string `json:"type"`
+	MessageID     string `json:"message_id"`
+}
+
+type privateControlSnapshotParticipant struct {
+	SenderID uint32 `json:"sender_id"`
+	State    string `json:"state"`
+}
+
+type privateControlSnapshotChannel struct {
+	ChannelID    uint32                              `json:"channel_id"`
+	Participants []privateControlSnapshotParticipant `json:"participants"`
+}
+
+type privateControlRelayStateSnapshot struct {
+	SchemaVersion string                          `json:"schema_version"`
+	Type          string                          `json:"type"`
+	MessageID     string                          `json:"message_id"`
+	InReplyTo     string                          `json:"in_reply_to"`
+	SnapshotID    string                          `json:"snapshot_id"`
+	ChunkIndex    uint16                          `json:"chunk_index"`
+	ChunkCount    uint16                          `json:"chunk_count"`
+	Channels      []privateControlSnapshotChannel `json:"channels"`
 }
 
 type privateControlRelayDiagnosticsSnapshot struct {
@@ -745,6 +773,8 @@ func (l *privateControlLink) enqueueAuditInput(input privateControlAuditInput) {
 }
 
 func (l *privateControlLink) publishLifecycleEvent(eventType string, channelID *uint32, senderID *uint32, serviceID *string, jobID *string, state *string, reason *string) {
+	l.eventMu.Lock()
+	defer l.eventMu.Unlock()
 	event, err := newPrivateControlLifecycleEvent(eventType, channelID, senderID, serviceID, jobID, state, reason)
 	if err != nil {
 		log.Printf("private control lifecycle event ID failed: %v", err)
@@ -901,6 +931,10 @@ func validPrivateControlPing(message privateControlPing) bool {
 
 func validPrivateControlGetRelayDiagnostics(message privateControlGetRelayDiagnostics) bool {
 	return message.SchemaVersion == privateControlSchemaVersion && message.Type == "get_relay_diagnostics" && validPrivateControlID(message.MessageID)
+}
+
+func validPrivateControlGetRelayStateSnapshot(message privateControlGetRelayStateSnapshot) bool {
+	return message.SchemaVersion == privateControlSchemaVersion && message.Type == "get_relay_state_snapshot" && validPrivateControlID(message.MessageID)
 }
 
 func decodePrivateControlSelector(raw []byte) (privateControlCommandEnvelope, error) {
@@ -1164,6 +1198,10 @@ func (l *privateControlLink) handleConnection(rawConnection net.Conn) {
 				if closeConnection {
 					l.recordConnectionFailure(source, "command")
 				}
+				return
+			}
+		case "get_relay_state_snapshot":
+			if !l.handleRelayStateSnapshot(session, rawMessage, selector) {
 				return
 			}
 		default:
