@@ -1,5 +1,11 @@
 # IncomUdon Relay Server
 
+## License
+
+The Relay source is licensed under the [MIT License](LICENSE). Third-party
+license texts and distribution notes are in
+[`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES/).
+
 ## Local run
 
 ```bash
