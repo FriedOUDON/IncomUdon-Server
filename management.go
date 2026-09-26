@@ -304,7 +304,7 @@ func loadManagementPolicy(servicesPath string, aclPath string, globalPermissions
 		}
 		for index, row := range rows {
 			service := policy.byService[row[0]]
-			if service == nil || !service.enabled || (row[1] != "health.read" && row[1] != "audit.read") {
+			if service == nil || !service.enabled || (row[1] != "health.read" && row[1] != "service_admission.revoke") {
 				return managementPolicy{}, fmt.Errorf("management-global-permissions.csv row %d is invalid", index+2)
 			}
 			enabled, err := parseManagementBool(row[2])

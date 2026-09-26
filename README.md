@@ -302,7 +302,7 @@ recorder-east,111,9001,recorder,true,false,false,0,true
 `management-global-permissions.csv` is an implementation-specific optional
 file for explicit non-channel permissions. Its strict format is
 `service_id,permission,enabled`; this Relay recognizes only `health.read` and
-`audit.read`. The private signing-key file is likewise Relay-local and has
+`service_admission.revoke`. The private signing-key file is likewise Relay-local and has
 the strict header `kid,ed25519_private_key_base64`; it contains one standard
 Base64 Ed25519 seed (32 bytes) or private key (64 bytes), and must be protected
 as a secret.

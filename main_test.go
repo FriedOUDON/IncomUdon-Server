@@ -1716,6 +1716,38 @@ func TestEmbeddedManagementPlaneDisablesAuditRetrieval(t *testing.T) {
 	}
 }
 
+func TestManagementGlobalPermissionsUseCanonicalRegistry(t *testing.T) {
+	directory := t.TempDir()
+	servicesPath := filepath.Join(directory, "management-services.csv")
+	aclPath := filepath.Join(directory, "management-channel-acl.csv")
+	permissionsPath := filepath.Join(directory, "management-global-permissions.csv")
+	certificateDigest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := os.WriteFile(servicesPath, []byte("service_id,certificate_sha256,api_role,enabled\nmanagement-admin,"+certificateDigest+",admin,true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aclPath, []byte("service_id,channel_id,sender_id,admission_role,allow_listen,allow_talk,allow_interrupt,interrupt_priority,enabled\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(permissionsPath, []byte("service_id,permission,enabled\nmanagement-admin,health.read,true\nmanagement-admin,service_admission.revoke,true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := loadManagementPolicy(servicesPath, aclPath, permissionsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := policy.byService["management-admin"]
+	if service == nil || !service.global["health.read"] || !service.global["service_admission.revoke"] {
+		t.Fatalf("global permissions = %#v", service)
+	}
+
+	if err := os.WriteFile(permissionsPath, []byte("service_id,permission,enabled\nmanagement-admin,audit.read,true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagementPolicy(servicesPath, aclPath, permissionsPath); err == nil {
+		t.Fatal("obsolete audit.read permission was accepted")
+	}
+}
+
 func TestEmbeddedManagementPlaneDoesNotExposeRecordingJobs(t *testing.T) {
 	relay := newTestUDPConn(t)
 	s := newServer(relay, false, false, false, 0, false, 1)
