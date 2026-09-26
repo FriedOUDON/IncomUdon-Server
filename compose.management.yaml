@@ -49,9 +49,13 @@ services:
       INCOMUDON_MANAGEMENT_PCL_TRANSPORT: "uds"
       INCOMUDON_MANAGEMENT_PCL_UDS_SOCKET_PATH: "/run/incomudon-pcl/relay.sock"
       INCOMUDON_MANAGEMENT_PCL_SERVICE_ID: "${INCOMUDON_MANAGEMENT_PCL_SERVICE_ID:-management-main}"
+      INCOMUDON_MANAGEMENT_PCL_COMMAND_STORE_FILE: "/var/lib/incomudon-management/pcl-revocations.json"
       INCOMUDON_MANAGEMENT_HTTP_LISTEN: ":8080"
     volumes:
       - private-control-socket:/run/incomudon-pcl
+      # The Management Service durably retries accepted PCL revocations after
+      # reconnect or restart. This state contains no grants or private keys.
+      - "${INCOMUDON_MANAGEMENT_STATE_DIR:-./management-state}:/var/lib/incomudon-management"
     expose:
       - "8080"
     depends_on:

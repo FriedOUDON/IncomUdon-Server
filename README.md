@@ -160,9 +160,11 @@ talk, or authentication state; zero remains reserved for Relay/System packets.
 ### Secret file handling
 
 Relay credential directories in `compose.yaml` and `compose.management.yaml`
-are bind-mounted read-only. The Private Control Link state directory is the
-intentional exception: it is a separate Relay-only writable mount for durable
-deny rules and idempotency acknowledgements. The Relay also checks
+are bind-mounted read-only. The Private Control Link state directory and the
+bundled Management Service command-store directory are intentional separate
+writable mounts: the former holds Relay durable deny rules and idempotency
+acknowledgements, and the latter holds Management-to-Relay revocation retries.
+The Relay also checks
 the private inputs it reads: Control Authentication keys and cookie secret,
 Directory channel-key CSV, Management Plane signing/TLS private keys, and
 the Private Control Link TLS private key when the mTLS TCP profile is selected.
@@ -183,6 +185,7 @@ directories private and give this account ownership before starting Compose:
 
 ```bash
 install -d -m 0700 -o 10001 -g 10001 control directory-v3 management private-control private-control-state
+install -d -m 0700 -o 10002 -g 10002 management-state
 chown 10001:10001 control/control-keys.csv control/cookie.secret \
   directory-v3/directory-keys.csv management/signing-key.csv management/server.key
 chmod 0600 control/control-keys.csv control/cookie.secret \
@@ -439,20 +442,23 @@ privileges separate. It uses the UDS profile by default: the PCL has no TCP
 port, and the Relay's UDP media port remains the only port published by the
 base Compose file.
 
-The initial Management Service image is a P1 live-event consumer with internal
-health endpoints; it is not yet the full external Management Plane API. It
-does not persist, replay, or expose the received events outside the internal
-network.
+The bundled Management Service provides live-only SSE, fresh Relay state from
+PCL snapshots, and Managed Service Admission grant and revocation handling.
+It does not currently provide replay SSE, Audit Retrieval, or recording
+orchestration.
 
-Prepare the UDS service policy and writable Relay state directory before
-starting the overlay:
+Prepare the UDS service policy and the separate writable Relay and Management
+state directories before starting the overlay:
 
 ```text
 private-control/                 # read-only in the Relay
   uds-services.csv
 
 private-control-state/           # writable only by the Relay (UID/GID 10001)
-  state.json                      # created automatically
+  state.json                     # created automatically
+
+management-state/                # writable only by Management (UID/GID 10002)
+  pcl-revocations.json            # created automatically; durable retry outbox
 ```
 
 The overlay's one-shot `private-control-socket-init` service initializes the
@@ -461,7 +467,9 @@ creates the socket for group `10003`; the Management Service runs as UID
 `10002` with that supplementary group. Keep these IDs and the
 `uds-services.csv` mapping aligned. The shared socket volume is read-write so
 the Management Service can connect, but it contains no credentials and its
-directory is not writable by that service.
+directory is not writable by that service. The separate `management-state/`
+mount is required: it stores pending PCL revocation commands before they are
+sent and removes them only after the Relay acknowledgement is durably handled.
 
 After copying the required configuration from `.env.example`, start both
 containers together:
