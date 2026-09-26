@@ -1716,6 +1716,19 @@ func TestEmbeddedManagementPlaneDisablesAuditRetrieval(t *testing.T) {
 	}
 }
 
+func TestEmbeddedManagementPlaneDoesNotExposeRecordingJobs(t *testing.T) {
+	relay := newTestUDPConn(t)
+	s := newServer(relay, false, false, false, 0, false, 1)
+	plane, _, _ := newTestManagementPlane(t, s, "recorder")
+	for _, path := range []string{"/v1/recording-jobs", "/v1/recording-jobs/example/stop"} {
+		response := httptest.NewRecorder()
+		plane.handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("recording endpoint %q status = %d, want %d", path, response.Code, http.StatusNotFound)
+		}
+	}
+}
+
 func TestEmbeddedManagementPlaneAdvertisesLiveOnlyCapabilities(t *testing.T) {
 	relay := newTestUDPConn(t)
 	s := newServer(relay, false, false, false, 0, false, 1)

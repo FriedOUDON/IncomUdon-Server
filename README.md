@@ -319,9 +319,11 @@ connected authorized subscribers, does not retain replay history, ignores a
 standard SSE `Last-Event-ID` during reconnect, rejects an explicit `since`
 query parameter, and returns `404` for `/v1/audit-records`. Set
 `INCOMUDON_MANAGEMENT_EVENT_DELIVERY=disabled` to omit SSE entirely. A
-deployment that needs replay-capable SSE, Audit Retrieval, or durable
-recording/revocation integration must use an external Management Service behind
-the private management boundary.
+deployment that needs replay-capable SSE, Audit Retrieval, recording-job
+control, or durable revocation integration must use an external Management
+Service behind the private management boundary. The embedded listener does not
+expose `/v1/recording-jobs`: it never creates a Recorder Worker or represents a
+local in-memory job as an active recording.
 
 ### Private Control Link Event Export
 

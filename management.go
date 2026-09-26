@@ -114,11 +114,6 @@ type managementFloorInterruptAudit struct {
 	ReplacedPriority  *uint8  `json:"replaced_priority"`
 }
 
-type managementRecordingJobAudit struct {
-	JobID             string `json:"job_id"`
-	RecorderServiceID string `json:"recorder_service_id"`
-}
-
 type managementAuditRecord struct {
 	RecordID       string                         `json:"record_id"`
 	Timestamp      string                         `json:"timestamp"`
@@ -128,15 +123,7 @@ type managementAuditRecord struct {
 	Action         string                         `json:"action"`
 	Result         string                         `json:"result"`
 	FloorInterrupt *managementFloorInterruptAudit `json:"floor_interrupt,omitempty"`
-	RecordingJob   *managementRecordingJobAudit   `json:"recording_job,omitempty"`
 	sequence       uint64
-}
-
-type managementRecordingJob struct {
-	jobID             string
-	channelID         uint32
-	recorderServiceID string
-	state             string
 }
 
 type managementSubscriber struct {
@@ -159,8 +146,6 @@ type managementPlane struct {
 	subscriberN    uint64
 	audit          []managementAuditRecord
 	auditNext      uint64
-	jobs           map[string]managementRecordingJob
-	jobNext        uint64
 	cursorKey      [32]byte
 }
 
@@ -369,7 +354,7 @@ func newManagementPlane(server *server, policy managementPolicy, signer manageme
 	// The embedded listener intentionally does not offer Audit Retrieval, so it
 	// has no audit cursor or durable-retention setup. Those features belong to
 	// an external Management Service.
-	return &managementPlane{server: server, policy: policy, signer: signer, issuer: issuer, audience: audience, eventDelivery: eventDelivery, subscribers: make(map[uint64]managementSubscriber), jobs: make(map[string]managementRecordingJob)}, nil
+	return &managementPlane{server: server, policy: policy, signer: signer, issuer: issuer, audience: audience, eventDelivery: eventDelivery, subscribers: make(map[uint64]managementSubscriber)}, nil
 }
 
 func startManagementPlane(server *server, config managementPlaneConfig) (*managementPlane, error) {
@@ -445,8 +430,6 @@ func (p *managementPlane) handler() http.Handler {
 	mux.HandleFunc("/v1/events", p.withService(p.handleEvents))
 	mux.HandleFunc("/v1/audit-records", p.withService(p.handleAuditRecords))
 	mux.HandleFunc("/v1/service-admission-grants", p.withService(p.handleServiceGrants))
-	mux.HandleFunc("/v1/recording-jobs", p.withService(p.handleRecordingJobs))
-	mux.HandleFunc("/v1/recording-jobs/", p.withService(p.handleRecordingJobStop))
 	return mux
 }
 
@@ -988,64 +971,6 @@ func (p *managementPlane) handleServiceGrants(w http.ResponseWriter, r *http.Req
 	p.publishEvent("service_admission_issued", uint32Pointer(request.ChannelID), uint32Pointer(request.SenderID), stringPointer(service.serviceID), nil, nil, nil)
 	w.Header().Set("Cache-Control", "no-store")
 	writeManagementJSON(w, http.StatusCreated, map[string]string{"grant": grant, "expires_at": expiresAt.Format(time.RFC3339)})
-}
-
-type recordingJobRequest struct {
-	ChannelID uint32 `json:"channel_id"`
-}
-
-func (p *managementPlane) recordingAllowedLocked(service *managementService, channelID uint32) bool {
-	return (service.apiRole == "recorder" || service.apiRole == "operator") && p.hasChannelACL(service.serviceID, channelID)
-}
-
-func (p *managementPlane) handleRecordingJobs(w http.ResponseWriter, r *http.Request, service *managementService) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var request recordingJobRequest
-	if err := decodeManagementJSON(r, &request); err != nil {
-		http.Error(w, "invalid recording request", http.StatusBadRequest)
-		return
-	}
-	p.mu.Lock()
-	if !p.recordingAllowedLocked(service, request.ChannelID) {
-		p.mu.Unlock()
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	p.jobNext++
-	job := managementRecordingJob{jobID: fmt.Sprintf("recording-%012d", p.jobNext), channelID: request.ChannelID, recorderServiceID: service.serviceID, state: "starting"}
-	p.jobs[job.jobID] = job
-	p.mu.Unlock()
-	p.appendAudit(managementAuditRecord{ActorType: "service", ActorID: service.serviceID, ChannelID: uint32Pointer(job.channelID), Action: "recording_create", Result: "success", RecordingJob: &managementRecordingJobAudit{JobID: job.jobID, RecorderServiceID: job.recorderServiceID}})
-	p.publishEvent("recording_state_changed", uint32Pointer(job.channelID), nil, stringPointer(service.serviceID), stringPointer(job.jobID), stringPointer(job.state), nil)
-	writeManagementJSON(w, http.StatusCreated, map[string]string{"job_id": job.jobID, "state": job.state})
-}
-
-func (p *managementPlane) handleRecordingJobStop(w http.ResponseWriter, r *http.Request, service *managementService) {
-	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/stop") {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	jobID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/recording-jobs/"), "/stop")
-	if jobID == "" || strings.Contains(jobID, "/") {
-		http.NotFound(w, r)
-		return
-	}
-	p.mu.Lock()
-	job, exists := p.jobs[jobID]
-	if !exists || !p.recordingAllowedLocked(service, job.channelID) {
-		p.mu.Unlock()
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	job.state = "stopping"
-	p.jobs[jobID] = job
-	p.mu.Unlock()
-	p.appendAudit(managementAuditRecord{ActorType: "service", ActorID: service.serviceID, ChannelID: uint32Pointer(job.channelID), Action: "recording_stop", Result: "success", RecordingJob: &managementRecordingJobAudit{JobID: job.jobID, RecorderServiceID: job.recorderServiceID}})
-	p.publishEvent("recording_state_changed", uint32Pointer(job.channelID), nil, stringPointer(service.serviceID), stringPointer(job.jobID), stringPointer(job.state), nil)
-	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *server) publishManagementEvent(eventType string, channelID *uint32, senderID *uint32, serviceID *string, jobID *string, state *string, reason *string) {
